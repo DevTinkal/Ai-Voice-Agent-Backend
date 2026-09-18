@@ -89,19 +89,35 @@ function buildRealtimeInputConfig() {
 
 /**
  * Build Live connect config for a phone call.
- * @param {{ midCall?: boolean }} [options]
+ * Requires caller-supplied systemInstruction (Mongo Agent.prompts combined).
+ * @param {{
+ *   systemInstruction: string,
+ *   midCall?: boolean,
+ *   sessionResumptionHandle?: string | null,
+ * }} options
  */
 function buildLiveConfig(options = {}) {
+  const base = String(options.systemInstruction || '').trim();
+  if (!base) {
+    throw new Error('systemInstruction is required for Live session');
+  }
+
   const systemInstruction = buildSystemInstruction(
+    base,
     new Date(),
     DEFAULT_TIMEZONE,
     {
       midCall: Boolean(options.midCall),
-      chatbotName: env.chatbotName,
     }
   );
 
   const realtimeInputConfig = buildRealtimeInputConfig();
+
+  /** @type {Record<string, unknown>} */
+  const sessionResumption = {};
+  if (options.sessionResumptionHandle) {
+    sessionResumption.handle = String(options.sessionResumptionHandle);
+  }
 
   return {
     responseModalities: [Modality.AUDIO],
@@ -116,6 +132,35 @@ function buildLiveConfig(options = {}) {
     inputAudioTranscription: {},
     outputAudioTranscription: {},
     realtimeInputConfig,
+    // Long-call: compress context so audio sessions are not hard-capped.
+    contextWindowCompression: {
+      slidingWindow: {},
+    },
+    // Long-call: enable resumption tokens; pass handle when reconnecting.
+    sessionResumption,
+    // Knowledge RAG — synchronous Live function calling (model waits for tool response).
+    tools: [
+      {
+        functionDeclarations: [
+          {
+            name: 'searchKnowledge',
+            description:
+              'Search the company knowledge base for facts relevant to the caller question.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                query: {
+                  type: 'STRING',
+                  description:
+                    "A concise search query representing the caller's factual question.",
+                },
+              },
+              required: ['query'],
+            },
+          },
+        ],
+      },
+    ],
   };
 }
 
@@ -126,18 +171,38 @@ function buildLiveConfig(options = {}) {
  *   onerror?: (err: ErrorEvent) => void,
  *   onclose?: (ev: CloseEvent) => void,
  *   onopen?: () => void,
+ *   systemInstruction: string,
  *   midCall?: boolean,
+ *   sessionResumptionHandle?: string | null,
  * }} handlers
  */
 async function connectLiveSession(handlers) {
   const ai = getClient();
   const model = env.geminiLiveModel;
-  const config = buildLiveConfig({ midCall: handlers.midCall });
+  const config = buildLiveConfig({
+    systemInstruction: handlers.systemInstruction,
+    midCall: handlers.midCall,
+    sessionResumptionHandle: handlers.sessionResumptionHandle || null,
+  });
 
   logger.info('LIVE', `Connecting Gemini Live model=${model}`);
   logger.info(
     'LIVE',
     `VAD config=${JSON.stringify(config.realtimeInputConfig)}`
+  );
+  logger.info(
+    'LIVE',
+    `session mgmt compression=slidingWindow resumptionHandle=${
+      handlers.sessionResumptionHandle ? 'yes' : 'new'
+    }`
+  );
+  logger.info(
+    'LIVE',
+    `systemInstruction chars=${String(config.systemInstruction || '').length}`
+  );
+  logger.info(
+    'MULTILINGUAL_DEBUG',
+    `voiceLanguage_env=${env.voiceLanguage} usage=prompt_preferred_spoken_setting_only speechConfig_languageCode=none input_not_restricted_by_VOICE_LANGUAGE`
   );
 
   const session = await ai.live.connect({
@@ -193,7 +258,9 @@ function sendPcm16kAudio(session, pcm16k) {
 }
 
 /**
- * Ask Live to speak a tight exact line (quick-facts path).
+ * Ask Live to speak a tight exact line.
+ * Disabled on the phone Live path (no business quick-facts bypass).
+ * Kept for non-Live / test callers only.
  * @param {import('@google/genai').Session} session
  * @param {string} exactSpeech
  */
@@ -219,7 +286,7 @@ function speakExactLine(session, exactSpeech) {
 /**
  * Trigger opening greeting via text turn (Live speaks it).
  * @param {import('@google/genai').Session} session
- * @param {string} greetingText
+ * @param {string} [greetingText]
  */
 function requestGreeting(session, greetingText) {
   if (!session) {
@@ -233,13 +300,32 @@ function requestGreeting(session, greetingText) {
           {
             text:
               greetingText ||
-              'The call just connected. Greet the caller briefly as instructed and ask how you can help.',
+              'Produce a brief opening response using the configured system instructions.',
           },
         ],
       },
     ],
     turnComplete: true,
   });
+}
+
+/**
+ * Reply to a Live toolCall with FunctionResponse objects.
+ * Gemini Live waits synchronously for this before continuing generation.
+ * @param {import('@google/genai').Session} session
+ * @param {object|object[]} functionResponses
+ */
+function sendToolResponse(session, functionResponses) {
+  if (!session || typeof session.sendToolResponse !== 'function') {
+    return;
+  }
+  const list = Array.isArray(functionResponses)
+    ? functionResponses
+    : [functionResponses];
+  if (!list.length) {
+    return;
+  }
+  session.sendToolResponse({ functionResponses: list });
 }
 
 /**
@@ -256,17 +342,109 @@ function parseLiveMessage(message) {
     interrupted: false,
     turnComplete: false,
     inputTranscription: '',
+    interimInputTranscription: '',
     outputTranscription: '',
     inputFinished: false,
     outputFinished: false,
+    userActivityEnd: false,
     audioBuffers: [],
+    goAway: null,
+    sessionResumptionUpdate: null,
+    functionCalls: [],
   };
 
   if (!message || typeof message !== 'object') {
     return result;
   }
 
+  if (message.goAway && typeof message.goAway === 'object') {
+    result.goAway = {
+      timeLeft: message.goAway.timeLeft != null ? String(message.goAway.timeLeft) : null,
+    };
+  }
+
+  if (
+    message.sessionResumptionUpdate &&
+    typeof message.sessionResumptionUpdate === 'object'
+  ) {
+    const u = message.sessionResumptionUpdate;
+    result.sessionResumptionUpdate = {
+      newHandle: u.newHandle != null ? String(u.newHandle) : null,
+      resumable: Boolean(u.resumable),
+      lastConsumedClientMessageIndex:
+        u.lastConsumedClientMessageIndex != null
+          ? String(u.lastConsumedClientMessageIndex)
+          : null,
+    };
+  }
+
+  // Live root toolCall (synchronous function calling).
+  const rootCalls =
+    message.toolCall && Array.isArray(message.toolCall.functionCalls)
+      ? message.toolCall.functionCalls
+      : [];
+  for (const fc of rootCalls) {
+    if (!fc || !fc.name) continue;
+    let args = fc.args || fc.arguments || {};
+    if (typeof args === 'string') {
+      try {
+        args = JSON.parse(args);
+      } catch {
+        args = { query: args };
+      }
+    }
+    result.functionCalls.push({
+      id: fc.id != null ? String(fc.id) : undefined,
+      name: String(fc.name),
+      args: args && typeof args === 'object' ? args : {},
+    });
+  }
+
+  // Prefer explicit server voice-activity end when present (Gemini Live VAD).
+  const va = message.voiceActivity;
+  if (va && typeof va === 'object') {
+    const vat = String(va.voiceActivityType || va.type || '');
+    if (vat.includes('ACTIVITY_END') || vat === 'ACTIVITY_END') {
+      result.userActivityEnd = true;
+    }
+  }
+  const vadSig = message.voiceActivityDetectionSignal;
+  if (vadSig && typeof vadSig === 'object') {
+    const vst = String(vadSig.vadSignalType || '');
+    if (vst.includes('END') || vst.includes('STOP')) {
+      result.userActivityEnd = true;
+    }
+  }
+
   const sc = message.serverContent;
+  // Transcriptions may appear on serverContent and/or message root (API variants).
+  const inputTx =
+    (sc && sc.inputTranscription) || message.inputTranscription || null;
+  const interimTx =
+    (sc && sc.interimInputTranscription) ||
+    message.interimInputTranscription ||
+    null;
+  const outputTx =
+    (sc && sc.outputTranscription) || message.outputTranscription || null;
+
+  if (inputTx && inputTx.text) {
+    result.inputTranscription = String(inputTx.text);
+    result.inputFinished = Boolean(inputTx.finished);
+  }
+  if (inputTx && inputTx.finished) {
+    result.inputFinished = true;
+  }
+  if (interimTx && interimTx.text) {
+    result.interimInputTranscription = String(interimTx.text);
+  }
+  if (outputTx && outputTx.text) {
+    result.outputTranscription = String(outputTx.text);
+    result.outputFinished = Boolean(outputTx.finished);
+  }
+  if (outputTx && outputTx.finished) {
+    result.outputFinished = true;
+  }
+
   if (!sc || typeof sc !== 'object') {
     return result;
   }
@@ -277,14 +455,6 @@ function parseLiveMessage(message) {
   if (sc.turnComplete) {
     result.turnComplete = true;
   }
-  if (sc.inputTranscription && sc.inputTranscription.text) {
-    result.inputTranscription = String(sc.inputTranscription.text);
-    result.inputFinished = Boolean(sc.inputTranscription.finished);
-  }
-  if (sc.outputTranscription && sc.outputTranscription.text) {
-    result.outputTranscription = String(sc.outputTranscription.text);
-    result.outputFinished = Boolean(sc.outputTranscription.finished);
-  }
 
   const parts =
     sc.modelTurn && Array.isArray(sc.modelTurn.parts)
@@ -293,6 +463,23 @@ function parseLiveMessage(message) {
 
   for (const part of parts) {
     if (!part) continue;
+    if (part.functionCall && part.functionCall.name) {
+      const fc = part.functionCall;
+      let args = fc.args || fc.arguments || {};
+      if (typeof args === 'string') {
+        try {
+          args = JSON.parse(args);
+        } catch {
+          args = { query: args };
+        }
+      }
+      result.functionCalls.push({
+        id: fc.id != null ? String(fc.id) : undefined,
+        name: String(fc.name),
+        args: args && typeof args === 'object' ? args : {},
+      });
+      continue;
+    }
     const inline = part.inlineData || part.inline_data;
     if (inline && inline.data && typeof inline.data === 'string') {
       const mime = String(inline.mimeType || inline.mime_type || '');
@@ -310,6 +497,7 @@ module.exports = {
   sendPcm16kAudio,
   speakExactLine,
   requestGreeting,
+  sendToolResponse,
   parseLiveMessage,
   buildLiveConfig,
   buildRealtimeInputConfig,

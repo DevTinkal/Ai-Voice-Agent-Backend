@@ -5,3 +5,8 @@ node_modules/
 npm-debug.log*
 coverage/
 .nyc_output/
+# Large knowledge dumps — keep local only
+knowledge/company.txt
+knowledge/*.txt
+!knowledge/.gitkeep
+!knowledge/README.md

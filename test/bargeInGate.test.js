@@ -154,9 +154,40 @@ describe('Gemini Live VAD config', () => {
   });
 
   it('buildLiveConfig includes realtimeInputConfig', () => {
-    const live = buildLiveConfig({ midCall: false });
+    const live = buildLiveConfig({
+      midCall: false,
+      systemInstruction: 'You are a test voice agent.',
+    });
     assert.ok(live.realtimeInputConfig);
     assert.ok(live.realtimeInputConfig.automaticActivityDetection);
+    assert.match(String(live.systemInstruction), /test voice agent/);
+    assert.doesNotMatch(String(live.systemInstruction), /Parker|JPLoft/i);
+  });
+
+  it('buildLiveConfig enables context compression and session resumption', () => {
+    const fresh = buildLiveConfig({
+      midCall: false,
+      systemInstruction: 'Base prompt A.',
+    });
+    assert.ok(fresh.contextWindowCompression);
+    assert.ok(fresh.contextWindowCompression.slidingWindow);
+    assert.ok(fresh.sessionResumption);
+    assert.equal(fresh.sessionResumption.handle, undefined);
+
+    const resumed = buildLiveConfig({
+      midCall: true,
+      systemInstruction: 'Base prompt B.',
+      sessionResumptionHandle: 'handle-abc',
+    });
+    assert.equal(resumed.sessionResumption.handle, 'handle-abc');
+    assert.ok(resumed.contextWindowCompression.slidingWindow);
+  });
+
+  it('buildLiveConfig rejects missing systemInstruction', () => {
+    assert.throws(
+      () => buildLiveConfig({ midCall: false }),
+      /systemInstruction is required/
+    );
   });
 });
 

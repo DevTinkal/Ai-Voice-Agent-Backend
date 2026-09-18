@@ -1,38 +1,39 @@
 'use strict';
 
 /**
- * Detect caller wait/hold and resume phrases from Live input transcription.
+ * Generic wait/hold and resume phrase detection (technical mute control).
+ * No business / company answers — pattern lists are local heuristics only.
  */
 
-const WAIT_PATTERNS = [
-  /^\s*(wait[.!]?\s*)+$/i,
-  /^\s*hold\s+on[.!]?\s*$/i,
-  /^\s*hang\s+on[.!]?\s*$/i,
-  /^\s*one\s+second[.!]?\s*$/i,
-  /^\s*one\s+sec[.!]?\s*$/i,
-  /^\s*just\s+a\s+(second|sec|moment|minute|min)[.!]?\s*$/i,
-  /^\s*give\s+me\s+a\s+(second|sec|moment|minute|min)[.!]?\s*$/i,
-  /^\s*hold\s+please[.!]?\s*$/i,
-  /^\s*please\s+(wait|hold)[.!]?\s*$/i,
-  /^\s*wait\s+a\s+(second|sec|moment|minute|min)[.!]?\s*$/i,
-  /^\s*can\s+you\s+(wait|hold)\b.*$/i,
-  /^\s*wait\s+a\s+(second|sec|moment|minute|min)[,.]?\s*(please\s+)?hold[.!]?\s*$/i,
-  /^\s*hang\s+on[,.]?\s*(one|a)?\s*(second|sec|moment|minute)?[.!]?\s*$/i,
-  /^\s*hold\s+for\s+a\s+(second|sec|moment|minute)[.!]?\s*$/i,
-  /^\s*wait\s+a\s+minute[.!]?\s*$/i,
-  /^\s*please\s+wait[,.]?\s*(a\s+)?(second|moment|minute)?[.!]?\s*$/i,
+const WAIT_PATTERN_SOURCES = [
+  '^\\s*(wait[.!]?\\s*)+$',
+  '^\\s*hold\\s+on[.!]?\\s*$',
+  '^\\s*hang\\s+on[.!]?\\s*$',
+  '^\\s*one\\s+second[.!]?\\s*$',
+  '^\\s*one\\s+sec[.!]?\\s*$',
+  '^\\s*just\\s+a\\s+(second|sec|moment|minute|min)[.!]?\\s*$',
+  '^\\s*give\\s+me\\s+a\\s+(second|sec|moment|minute|min)[.!]?\\s*$',
+  '^\\s*please\\s+(wait|hold)[.!]?\\s*$',
 ];
 
-const RESUME_PATTERNS = [
-  /^\s*(okay|ok|alright|all\s+right)[,.]?\s*(continue|go\s+on|proceed)?\.?\s*$/i,
-  /^\s*continue\.?\s*$/i,
-  /^\s*go\s+on\.?\s*$/i,
-  /^\s*proceed\.?\s*$/i,
-  /^\s*i('?m|\s+am)\s+back\.?\s*$/i,
-  /^\s*ready\.?\s*$/i,
-  /^\s*you\s+can\s+continue\.?\s*$/i,
-  /^\s*please\s+continue\.?\s*$/i,
+const RESUME_PATTERN_SOURCES = [
+  '^\\s*(okay|ok|alright|all\\s+right)[,.]?\\s*(continue|go\\s+on|proceed)?\\.?\\s*$',
+  '^\\s*continue\\.?\\s*$',
+  '^\\s*go\\s+on\\.?\\s*$',
+  '^\\s*proceed\\.?\\s*$',
+  '^\\s*i(\'?m|\\s+am)\\s+back\\.?\\s*$',
+  '^\\s*ready\\.?\\s*$',
+  '^\\s*you\\s+can\\s+continue\\.?\\s*$',
+  '^\\s*please\\s+continue\\.?\\s*$',
+  '^\\s*(go\\s+ahead|resume)[.!]?\\s*$',
 ];
+
+function compilePatterns(list) {
+  return list.map((source) => new RegExp(String(source), 'i'));
+}
+
+const WAIT_PATTERNS = compilePatterns(WAIT_PATTERN_SOURCES);
+const RESUME_PATTERNS = compilePatterns(RESUME_PATTERN_SOURCES);
 
 function normalize(text) {
   return typeof text === 'string' ? text.trim().replace(/\s+/g, ' ') : '';
@@ -44,18 +45,24 @@ function isWaitHold(text) {
     return false;
   }
 
-  // Short utterances that are only wait-like words.
-  if (/^(wait|hold|hang)([.\s!,]+(wait|hold|on|hang|please|a|second|sec|moment|minute|min))*$/i.test(value)) {
+  if (
+    /^(wait|hold|hang)([.\s!,]+(wait|hold|on|hang|please|a|second|sec|moment|minute|min))*$/i.test(
+      value
+    )
+  ) {
     return true;
   }
 
-  // Compound: contains wait/hold intent and is short enough to be a control phrase.
   const lower = value.toLowerCase();
   const hasWaitIntent =
     /\b(wait|hold on|hang on|please hold|please wait|one second|just a (second|moment|minute)|give me a (second|moment|minute))\b/i.test(
       lower
     );
-  if (hasWaitIntent && value.split(/\s+/).length <= 10 && !/\b(project|app|website|build|price|cost|need)\b/i.test(lower)) {
+  if (
+    hasWaitIntent &&
+    value.split(/\s+/).length <= 10 &&
+    !/\b(project|app|website|build|price|cost|need)\b/i.test(lower)
+  ) {
     return true;
   }
 

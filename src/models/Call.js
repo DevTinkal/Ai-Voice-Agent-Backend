@@ -62,6 +62,12 @@ const callSchema = new mongoose.Schema(
       type: Date,
       default: Date.now,
     },
+    agentId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Agent',
+      default: null,
+      index: true,
+    },
   },
   {
     timestamps: true,

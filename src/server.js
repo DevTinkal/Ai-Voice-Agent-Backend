@@ -11,9 +11,14 @@ const {
 const mediaStream = require('./websocket/mediaStream');
 const conversationRelay = require('./websocket/conversationRelay');
 const dashboardSocket = require('./websocket/dashboardSocket');
+const liveCallSession = require('./services/liveCallSession');
+const { migrateOnceIfEmpty } = require('./services/agentBootstrap');
 const logger = require('./utils/logger');
 
 async function start() {
+  // Fresh latency log per server run (tests write here too; startup clears them).
+  liveCallSession.clearLatencyLogOnStartup();
+
   const app = createApp();
   const server = http.createServer(app);
 
@@ -53,6 +58,12 @@ async function start() {
   });
 
   await connectDatabase();
+  try {
+    await migrateOnceIfEmpty();
+  } catch (error) {
+    logger.warn('AGENT', `Optional seed skipped: ${error.message}`);
+  }
+  // Knowledge index is built from Agent.prompt on Save — not from company.txt.
 
   await new Promise((resolve, reject) => {
     server.once('error', (error) => {
@@ -70,8 +81,11 @@ async function start() {
       reject(error);
     });
 
-    server.listen(env.port, () => {
-      logger.info('SERVER', `HTTP server started on port ${env.port}`);
+    server.listen(env.port, '0.0.0.0', () => {
+      logger.info(
+        'SERVER',
+        `HTTP server started on 0.0.0.0:${env.port} (localhost + LAN)`
+      );
       logger.info(
         'SERVER',
         `Phone path: Gemini Live + Media Streams (${env.mediaStreamWsUrl || 'MEDIA_STREAM_WS_URL unset'})`

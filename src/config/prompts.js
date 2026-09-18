@@ -1,98 +1,42 @@
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
-const { env } = require('./env');
 const { getTimeOfDay, DEFAULT_TIMEZONE } = require('../utils/timeOfDay');
-const logger = require('../utils/logger');
-
-const PROMPT_FILE_PATH = path.resolve(
-  __dirname,
-  '../prompts/jploft-sales-executive-phone.txt'
-);
-
-// Original chatbot prompt — kept on disk; not used by the phone Live path.
-const CHATBOT_PROMPT_FILE_PATH = path.resolve(
-  __dirname,
-  '../prompts/jploft-sales-executive.txt'
-);
-
-let cachedPrompt = null;
 
 /**
- * Loads the phone-call-only JPLoft Sales Executive instructions.
- * @param {boolean} [forceReload=false]
- * @returns {string}
- */
-function loadJploftPrompt(forceReload = false) {
-  if (cachedPrompt && !forceReload) {
-    return cachedPrompt;
-  }
-
-  try {
-    if (!fs.existsSync(PROMPT_FILE_PATH)) {
-      const err = new Error(
-        `FATAL: JPLoft phone prompt file not found at: ${PROMPT_FILE_PATH}`
-      );
-      logger.error('PROMPT', err.message);
-      throw err;
-    }
-
-    const content = fs.readFileSync(PROMPT_FILE_PATH, 'utf8').trim();
-    if (!content) {
-      const err = new Error(
-        `FATAL: JPLoft phone prompt file is empty at: ${PROMPT_FILE_PATH}`
-      );
-      logger.error('PROMPT', err.message);
-      throw err;
-    }
-
-    cachedPrompt = content;
-    logger.info(
-      'PROMPT',
-      `Loaded JPLoft phone instructions from ${PROMPT_FILE_PATH} (${cachedPrompt.length} chars)`
-    );
-    return cachedPrompt;
-  } catch (err) {
-    logger.error('PROMPT', `Failed to load JPLoft phone prompt: ${err.message}`);
-    throw err;
-  }
-}
-
-/**
- * System instruction for Gemini Live phone sessions.
+ * Purely technical voice-channel append for Gemini Live.
+ * No identity, company, sales, or hardcoded agent personality.
+ *
+ * @param {string} baseInstruction - Combined Agent.prompts (+ language policy) from MongoDB
  * @param {Date} [now]
  * @param {string} [timeZone]
- * @param {{ midCall?: boolean, chatbotName?: string }} [options]
+ * @param {{ midCall?: boolean }} [options]
  */
 function buildSystemInstruction(
+  baseInstruction,
   now = new Date(),
   timeZone = DEFAULT_TIMEZONE,
   options = {}
 ) {
-  const staticInstructions = loadJploftPrompt();
-  const chatbotName = options.chatbotName || env.chatbotName || 'Parker';
-  const resolvedStatic = staticInstructions.replace(
-    /\{chatbotName\}/g,
-    chatbotName
-  );
+  const base = String(baseInstruction || '').trim();
+  if (!base) {
+    throw new Error('systemInstruction is required');
+  }
 
-  const { greeting, period, helpWhen } = getTimeOfDay(now, timeZone);
+  const { greeting, period } = getTimeOfDay(now, timeZone);
   const midCall = Boolean(options.midCall);
 
   const phaseBlock = midCall
     ? `Call phase: MID-CALL. Do not greet again. Do not say "${greeting}".`
-    : `Call phase: OPENING. You may greet once with "${greeting}" and introduce yourself as ${chatbotName} from JPLoft, then ask how you can help ${helpWhen}.`;
+    : 'Call phase: OPENING. Produce a brief opening response using the configured system instructions.';
 
-  return `${resolvedStatic}
+  return `${base}
 
 ==================================================
 PHONE VOICE CHANNEL & RUNTIME CONTEXT (GEMINI LIVE)
 ==================================================
 Channel: Twilio phone call via Gemini Live bidirectional audio.
 Period: ${period}.
-Preferred spoken language setting: ${env.voiceLanguage}.
-Still follow the caller's latest meaningful language (English / Hindi / Hinglish).
+Follow the LANGUAGE POLICY in the configured system instructions above for spoken replies.
 
 ${phaseBlock}
 
@@ -104,16 +48,22 @@ CRITICAL VOICE OUTPUT RULES:
 5. Wait/hold pauses are handled by the backend — do not invent hold acknowledgements unless the caller resumes.`;
 }
 
-const SYSTEM_INSTRUCTION = buildSystemInstruction();
+/**
+ * Neutral technical greeting kick — no identity/company in code.
+ */
+function buildGreetingInstruction() {
+  return 'Produce a brief opening response using the configured system instructions.';
+}
 
 const FALLBACK_SPEECH =
   "I'm sorry, I'm having trouble with that right now. Could you try again?";
+
+/** @deprecated Legacy ConversationRelay path — empty without Mongo agent. */
+const SYSTEM_INSTRUCTION = FALLBACK_SPEECH;
 
 module.exports = {
   SYSTEM_INSTRUCTION,
   FALLBACK_SPEECH,
   buildSystemInstruction,
-  loadJploftPrompt,
-  PROMPT_FILE_PATH,
-  CHATBOT_PROMPT_FILE_PATH,
+  buildGreetingInstruction,
 };

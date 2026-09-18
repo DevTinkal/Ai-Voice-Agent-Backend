@@ -7,29 +7,41 @@ const path = require('path');
 const twilio = require('twilio');
 
 describe('phone prompt and env wiring', () => {
-  it('loads phone prompt with chatbotName placeholder and no UI chips', () => {
+  it('builds Live instruction from caller-supplied base only (no Parker/JPLoft)', () => {
     const {
-      loadJploftPrompt,
       buildSystemInstruction,
-      PROMPT_FILE_PATH,
-      CHATBOT_PROMPT_FILE_PATH,
+      buildGreetingInstruction,
+      FALLBACK_SPEECH,
     } = require('../src/config/prompts');
 
-    assert.ok(fs.existsSync(PROMPT_FILE_PATH));
-    assert.ok(fs.existsSync(CHATBOT_PROMPT_FILE_PATH));
-
-    const phone = loadJploftPrompt(true);
-    assert.match(phone, /\{chatbotName\}/);
-    assert.doesNotMatch(phone, /suggestion chips/i);
-    assert.doesNotMatch(phone, /mailto:/i);
-
-    const instruction = buildSystemInstruction(new Date(), 'Asia/Kolkata', {
-      chatbotName: 'TestAgent',
+    const base = "You are Acme Voice Bot.\nFollow the caller's language.";
+    const instruction = buildSystemInstruction(base, new Date(), 'Asia/Kolkata', {
       midCall: false,
     });
-    assert.match(instruction, /TestAgent/);
-    assert.doesNotMatch(instruction, /\{chatbotName\}/);
+    assert.match(instruction, /Acme Voice Bot/);
     assert.match(instruction, /GEMINI LIVE/i);
+    assert.match(instruction, /LANGUAGE POLICY/i);
+    assert.doesNotMatch(instruction, /Parker/i);
+    assert.doesNotMatch(instruction, /JPLoft/i);
+    assert.doesNotMatch(instruction, /Sales Executive/i);
+
+    const mid = buildSystemInstruction(base, new Date(), 'Asia/Kolkata', {
+      midCall: true,
+    });
+    assert.match(mid, /MID-CALL/);
+    assert.doesNotMatch(mid, /Parker|JPLoft/i);
+
+    const greet = buildGreetingInstruction();
+    assert.match(greet, /configured system instructions/i);
+    assert.doesNotMatch(greet, /Parker|JPLoft/i);
+
+    assert.ok(FALLBACK_SPEECH.length > 10);
+    assert.doesNotMatch(FALLBACK_SPEECH, /JPLoft/i);
+  });
+
+  it('rejects empty base systemInstruction', () => {
+    const { buildSystemInstruction } = require('../src/config/prompts');
+    assert.throws(() => buildSystemInstruction(''), /required/i);
   });
 
   it('exposes Live env fields', () => {
@@ -54,18 +66,29 @@ describe('phone prompt and env wiring', () => {
     assert.doesNotMatch(xml, /ConversationRelay/i);
   });
 
-  it('original chatbot prompt file remains on disk untouched as separate file', () => {
-    const chatbotPath = path.join(
+  it('retired txt dumps are archived and not the runtime source', () => {
+    const archivePhone = path.join(
       __dirname,
-      '../src/prompts/jploft-sales-executive.txt'
+      '../src/prompts/archive/jploft-sales-executive-phone.txt.corrupted-dump.bak'
     );
-    const phonePath = path.join(
+    const archiveChatbot = path.join(
+      __dirname,
+      '../src/prompts/archive/jploft-sales-executive.txt.bak'
+    );
+    const liveTxt = path.join(
       __dirname,
       '../src/prompts/jploft-sales-executive-phone.txt'
     );
-    assert.ok(fs.existsSync(chatbotPath));
-    assert.ok(fs.existsSync(phonePath));
-    const chatbot = fs.readFileSync(chatbotPath, 'utf8');
-    assert.match(chatbot, /suggestion chips/i);
+    assert.ok(fs.existsSync(archivePhone));
+    assert.ok(fs.existsSync(archiveChatbot));
+    assert.equal(fs.existsSync(liveTxt), false);
+
+    // Seed-only file may still exist; Live prompts.js must not require it.
+    const promptsSrc = fs.readFileSync(
+      path.join(__dirname, '../src/config/prompts.js'),
+      'utf8'
+    );
+    assert.doesNotMatch(promptsSrc, /agent\.config/);
+    assert.doesNotMatch(promptsSrc, /loadJploftPrompt/);
   });
 });

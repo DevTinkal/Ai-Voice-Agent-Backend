@@ -1,12 +1,18 @@
 'use strict';
 
 const twilio = require('twilio');
-const { env, getVoiceWebhookUrl, getMediaStreamWsUrl } = require('../config/env');
+const {
+  env,
+  getVoiceWebhookUrl,
+  getOutboundVoiceWebhookUrl,
+  getMediaStreamWsUrl,
+} = require('../config/env');
 const callService = require('../services/callService');
+const agentService = require('../services/agentService');
 const dashboardSocket = require('../websocket/dashboardSocket');
 const logger = require('../utils/logger');
 
-function validateTwilioRequest(req) {
+function validateTwilioRequest(req, expectedUrl) {
   if (env.skipTwilioSignature) {
     return true;
   }
@@ -27,7 +33,7 @@ function validateTwilioRequest(req) {
     return false;
   }
 
-  const url = getVoiceWebhookUrl();
+  const url = expectedUrl || getVoiceWebhookUrl();
   if (!url) {
     logger.error('TWILIO', 'PUBLIC_BASE_URL not set — cannot validate signature');
     return env.nodeEnv === 'development';
@@ -41,9 +47,60 @@ function validateTwilioRequest(req) {
   );
 }
 
+/**
+ * Shared Connect + Stream TwiML used by inbound and outbound answer webhooks.
+ */
+function buildMediaStreamTwiml(from, to) {
+  const mediaUrl = getMediaStreamWsUrl();
+  const VoiceResponse = twilio.twiml.VoiceResponse;
+  const response = new VoiceResponse();
+
+  if (!mediaUrl) {
+    response.say(
+      'We are sorry. The voice assistant is temporarily unavailable.'
+    );
+    return { xml: response.toString(), ok: false };
+  }
+
+  const connect = response.connect();
+  const stream = connect.stream({
+    url: mediaUrl,
+  });
+  stream.parameter({ name: 'from', value: from || '' });
+  stream.parameter({ name: 'to', value: to || '' });
+  return { xml: response.toString(), ok: true };
+}
+
+function buildAgentUnavailableTwiml() {
+  const VoiceResponse = twilio.twiml.VoiceResponse;
+  const response = new VoiceResponse();
+  response.say(
+    'We are sorry. The voice assistant is not configured. Please try again later.'
+  );
+  response.hangup();
+  return response.toString();
+}
+
+/**
+ * Resolve singleton agent before connecting Media Streams. Fail closed.
+ * @returns {Promise<{ ok: true, agentId: import('mongoose').Types.ObjectId } | { ok: false, xml: string }>}
+ */
+async function resolveAgentOrFailTwiml() {
+  try {
+    const resolved = await agentService.requireAgentForCall();
+    return { ok: true, agentId: resolved.agentId };
+  } catch (error) {
+    logger.error(
+      'TWILIO',
+      `Agent unavailable for call: ${error.code || 'AGENT_ERROR'} ${error.message}`
+    );
+    return { ok: false, xml: buildAgentUnavailableTwiml() };
+  }
+}
+
 async function handleIncomingCall(req, res) {
   try {
-    if (!validateTwilioRequest(req)) {
+    if (!validateTwilioRequest(req, getVoiceWebhookUrl())) {
       logger.warn('TWILIO', 'Invalid Twilio signature on /voice');
       return res.status(403).send('Forbidden');
     }
@@ -60,16 +117,17 @@ async function handleIncomingCall(req, res) {
       return res.status(400).send('Bad Request');
     }
 
-    const mediaUrl = getMediaStreamWsUrl();
-    if (!mediaUrl) {
-      logger.error('TWILIO', 'MEDIA_STREAM_WS_URL is not configured');
-      const VoiceResponse = twilio.twiml.VoiceResponse;
-      const errorResponse = new VoiceResponse();
-      errorResponse.say(
-        'We are sorry. The voice assistant is temporarily unavailable.'
-      );
+    const agentGate = await resolveAgentOrFailTwiml();
+    if (!agentGate.ok) {
       res.type('text/xml');
-      return res.status(200).send(errorResponse.toString());
+      return res.status(200).send(agentGate.xml);
+    }
+
+    const built = buildMediaStreamTwiml(from, to);
+    if (!built.ok) {
+      logger.error('TWILIO', 'MEDIA_STREAM_WS_URL is not configured');
+      res.type('text/xml');
+      return res.status(200).send(built.xml);
     }
 
     await callService.createCall({
@@ -77,7 +135,10 @@ async function handleIncomingCall(req, res) {
       from,
       to,
       status: 'incoming',
-      direction,
+      direction: direction === 'outbound-api' || direction === 'outbound'
+        ? 'outbound'
+        : 'inbound',
+      agentId: agentGate.agentId,
     });
 
     dashboardSocket.broadcast({
@@ -87,21 +148,12 @@ async function handleIncomingCall(req, res) {
         from,
         to,
         status: 'incoming',
+        direction: 'inbound',
       },
     });
 
-    const VoiceResponse = twilio.twiml.VoiceResponse;
-    const response = new VoiceResponse();
-    const connect = response.connect();
-    const stream = connect.stream({
-      url: mediaUrl,
-    });
-    // Custom params appear on Media Stream "start" for session context.
-    stream.parameter({ name: 'from', value: from || '' });
-    stream.parameter({ name: 'to', value: to || '' });
-
     res.type('text/xml');
-    return res.status(200).send(response.toString());
+    return res.status(200).send(built.xml);
   } catch (error) {
     logger.error('TWILIO', `Incoming call error: ${error.message}`);
     const VoiceResponse = twilio.twiml.VoiceResponse;
@@ -114,7 +166,78 @@ async function handleIncomingCall(req, res) {
   }
 }
 
+/**
+ * TwiML webhook for outbound calls after the callee answers.
+ * Same Media Stream pipeline as inbound — does not change /voice.
+ */
+async function handleOutboundTwiml(req, res) {
+  try {
+    if (!validateTwilioRequest(req, getOutboundVoiceWebhookUrl())) {
+      logger.warn('TWILIO', 'Invalid Twilio signature on /voice/outbound');
+      return res.status(403).send('Forbidden');
+    }
+
+    const callSid = req.body.CallSid;
+    const from = req.body.From;
+    const to = req.body.To;
+
+    logger.info('TWILIO', 'Outbound call answered (Gemini Live + Media Streams)');
+
+    if (!callSid) {
+      logger.warn('TWILIO', 'Missing CallSid on outbound TwiML');
+      return res.status(400).send('Bad Request');
+    }
+
+    const agentGate = await resolveAgentOrFailTwiml();
+    if (!agentGate.ok) {
+      res.type('text/xml');
+      return res.status(200).send(agentGate.xml);
+    }
+
+    const built = buildMediaStreamTwiml(from, to);
+    if (!built.ok) {
+      logger.error('TWILIO', 'MEDIA_STREAM_WS_URL is not configured');
+      res.type('text/xml');
+      return res.status(200).send(built.xml);
+    }
+
+    await callService.createCall({
+      callSid,
+      from,
+      to,
+      status: 'incoming',
+      direction: 'outbound',
+      agentId: agentGate.agentId,
+    });
+
+    dashboardSocket.broadcast({
+      type: 'CALL_OUTBOUND_ANSWERED',
+      data: {
+        callSid,
+        from,
+        to,
+        status: 'incoming',
+        direction: 'outbound',
+      },
+    });
+
+    res.type('text/xml');
+    return res.status(200).send(built.xml);
+  } catch (error) {
+    logger.error('TWILIO', `Outbound TwiML error: ${error.message}`);
+    const VoiceResponse = twilio.twiml.VoiceResponse;
+    const response = new VoiceResponse();
+    response.say(
+      "I'm sorry, something went wrong. Please try calling again later."
+    );
+    res.type('text/xml');
+    return res.status(200).send(response.toString());
+  }
+}
+
 module.exports = {
   handleIncomingCall,
+  handleOutboundTwiml,
   validateTwilioRequest,
+  buildMediaStreamTwiml,
 };

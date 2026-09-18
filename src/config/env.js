@@ -36,6 +36,20 @@ const env = {
   geminiLiveModel:
     process.env.GEMINI_LIVE_MODEL || 'gemini-3.1-flash-live-preview',
   geminiLiveVoice: process.env.GEMINI_LIVE_VOICE || 'Aoede',
+  /** Never use text-embedding-004 (shutdown Jan 2026). */
+  geminiEmbeddingModel:
+    process.env.GEMINI_EMBEDDING_MODEL || 'gemini-embedding-2',
+  /** Keep query + document embeddings on the same dimensionality. */
+  geminiEmbeddingDimensions:
+    Number(process.env.GEMINI_EMBEDDING_DIMENSIONS) || 768,
+  knowledgeMinScore: Number(process.env.KNOWLEDGE_MIN_SCORE) || 0,
+  knowledgeTopK: Number(process.env.KNOWLEDGE_TOP_K) || 5,
+  knowledgeMaxChars: Number(process.env.KNOWLEDGE_MAX_CHARS) || 6000,
+  /**
+   * Absolute or backend-relative path to the single knowledge source file.
+   * Default: backend/knowledge/company.txt
+   */
+  knowledgeSourcePath: process.env.KNOWLEDGE_SOURCE_PATH || '',
   voiceLanguage: process.env.VOICE_LANGUAGE || 'en-US',
   chatbotName: process.env.CHATBOT_NAME || 'Parker',
   dashboardWsUrl: process.env.DASHBOARD_WS_URL || '',
@@ -54,6 +68,13 @@ function getVoiceWebhookUrl() {
   return `${env.publicBaseUrl.replace(/\/$/, '')}/voice`;
 }
 
+function getOutboundVoiceWebhookUrl() {
+  if (!env.publicBaseUrl) {
+    return '';
+  }
+  return `${env.publicBaseUrl.replace(/\/$/, '')}/voice/outbound`;
+}
+
 function getMediaStreamWsUrl() {
   return env.mediaStreamWsUrl || '';
 }
@@ -61,5 +82,6 @@ function getMediaStreamWsUrl() {
 module.exports = {
   env,
   getVoiceWebhookUrl,
+  getOutboundVoiceWebhookUrl,
   getMediaStreamWsUrl,
 };

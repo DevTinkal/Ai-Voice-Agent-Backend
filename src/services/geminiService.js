@@ -165,10 +165,12 @@ function buildConfig(abortSignal, history, options = {}) {
   const includeThinking = options.includeThinking !== false;
   const config = {
     // Rebuild each request so morning/afternoon/evening and call phase stay accurate.
-    systemInstruction: buildSystemInstruction(new Date(), DEFAULT_TIMEZONE, {
-      midCall,
-      chatbotName: env.chatbotName,
-    }),
+    systemInstruction: buildSystemInstruction(
+      FALLBACK_SPEECH,
+      new Date(),
+      DEFAULT_TIMEZONE,
+      { midCall }
+    ),
     maxOutputTokens: PHONE_MAX_OUTPUT_TOKENS,
   };
 

@@ -2,8 +2,11 @@
 
 const callService = require('../services/callService');
 const conversationService = require('../services/conversationService');
+const twilioVoiceService = require('../services/twilioVoiceService');
+const agentService = require('../services/agentService');
+const dashboardSocket = require('../websocket/dashboardSocket');
 const { getDatabaseStatus } = require('../config/database');
-const { env } = require('../config/env');
+const { env, getOutboundVoiceWebhookUrl } = require('../config/env');
 const logger = require('../utils/logger');
 
 async function listCalls(req, res) {
@@ -53,6 +56,111 @@ async function getStats(req, res) {
   } catch (error) {
     logger.error('API', `getStats failed: ${error.message}`);
     return res.status(500).json({ error: 'Failed to retrieve stats' });
+  }
+}
+
+async function startOutboundCall(req, res) {
+  try {
+    const phoneNumber = req.body && req.body.phoneNumber;
+    let to;
+    try {
+      to = twilioVoiceService.normalizeAndValidateE164(phoneNumber);
+    } catch (error) {
+      return res.status(error.status || 400).json({
+        error: error.message,
+        code: error.code || 'INVALID_PHONE',
+      });
+    }
+
+    const twimlUrl = getOutboundVoiceWebhookUrl();
+    if (!twimlUrl) {
+      return res.status(503).json({
+        error: 'PUBLIC_BASE_URL is not configured for outbound TwiML',
+        code: 'TWIML_URL_MISSING',
+      });
+    }
+    if (!env.mediaStreamWsUrl && !env.publicBaseUrl) {
+      return res.status(503).json({
+        error: 'MEDIA_STREAM_WS_URL / PUBLIC_BASE_URL not configured',
+        code: 'MEDIA_STREAM_MISSING',
+      });
+    }
+
+    let agentResolved;
+    try {
+      agentResolved = await agentService.requireAgentForCall();
+    } catch (error) {
+      return res.status(error.status || 400).json({
+        error: error.message || 'Agent configuration invalid',
+        code: error.code || 'AGENT_CONFIG_ERROR',
+      });
+    }
+
+    const created = await twilioVoiceService.createOutboundCall({
+      to,
+      twimlUrl,
+    });
+
+    await callService.createCall({
+      callSid: created.callSid,
+      from: created.from,
+      to: created.to,
+      status: 'incoming',
+      direction: 'outbound',
+      agentId: agentResolved.agentId,
+    });
+
+    dashboardSocket.broadcast({
+      type: 'CALL_OUTBOUND_STARTED',
+      data: {
+        callSid: created.callSid,
+        from: created.from,
+        to: created.to,
+        status: created.status,
+        direction: 'outbound',
+        agentId: String(agentResolved.agentId),
+        agentName: agentResolved.agentName,
+      },
+    });
+
+    return res.status(201).json({
+      callSid: created.callSid,
+      status: created.status,
+      to: created.to,
+      from: created.from,
+      direction: 'outbound',
+      agentId: String(agentResolved.agentId),
+      agentName: agentResolved.agentName,
+    });
+  } catch (error) {
+    logger.error('API', `startOutboundCall failed: ${error.message}`);
+    return res.status(error.status || 502).json({
+      error: error.message || 'Failed to start outbound call',
+      code: error.code || 'OUTBOUND_FAILED',
+    });
+  }
+}
+
+async function hangupOutboundCall(req, res) {
+  try {
+    const { callSid } = req.params;
+    const result = await twilioVoiceService.hangupCall(callSid);
+    await callService.markCompleted(callSid);
+    dashboardSocket.broadcast({
+      type: 'CALL_COMPLETED',
+      data: {
+        callSid,
+        status: 'completed',
+        direction: 'outbound',
+      },
+    });
+    return res.json(result);
+  } catch (error) {
+    logger.error('API', `hangupOutboundCall failed: ${error.message}`);
+    return res.status(error.status || 502).json({
+      error: error.message || 'Failed to hang up call',
+      code: error.code || 'HANGUP_FAILED',
+    });
   }
 }
 
@@ -116,4 +224,6 @@ module.exports = {
   getCall,
   getStats,
   healthCheck,
+  startOutboundCall,
+  hangupOutboundCall,
 };

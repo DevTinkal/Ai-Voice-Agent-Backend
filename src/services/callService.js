@@ -17,6 +17,9 @@ async function createCall(data) {
       existing.to = data.to || existing.to;
       existing.status = data.status || existing.status;
       existing.direction = data.direction || existing.direction;
+      if (data.agentId) {
+        existing.agentId = data.agentId;
+      }
       existing.lastActivityAt = new Date();
       await existing.save();
       logger.info('CALL', `Call updated ${data.callSid}`);
@@ -29,6 +32,7 @@ async function createCall(data) {
       to: data.to || null,
       status: data.status || 'incoming',
       direction: data.direction || 'inbound',
+      agentId: data.agentId || null,
       startedAt: new Date(),
       lastActivityAt: new Date(),
     });

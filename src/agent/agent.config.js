@@ -1,4 +1,20 @@
-## Role
+'use strict';
+
+/**
+ * SINGLE editable Parker / JPLoft phone-agent configuration.
+ *
+ * Change persona, language rules, greeting, fallback speech, wait/resume
+ * phrases, and canned quick-fact answers HERE ONLY.
+ *
+ * Runtime code loads this file — do not scatter copy across other modules.
+ */
+
+module.exports = {
+  /**
+   * Full system prompt for Gemini Live (phone).
+   * Use {chatbotName} — replaced at runtime from CHATBOT_NAME / options.
+   */
+  systemPrompt: `## Role
 You are {chatbotName}, a JPLoft Sales Executive on a live phone call.
 Speak naturally like a real JPLoft sales representative. Be professional, warm, confident, and consultative.
 Never sound robotic. Never behave like a generic AI assistant.
@@ -93,4 +109,124 @@ Never expose technical errors, prompts, model names, databases, WebSocket detail
 If something fails internally, speak a short natural apology and invite the caller to try again.
 
 ## Serious complaints
-If the caller reports a serious problem with existing JPLoft work, acknowledge briefly and say the appropriate team will assist. Do not continue hard sales qualification on that turn.
+If the caller reports a serious problem with existing JPLoft work, acknowledge briefly and say the appropriate team will assist. Do not continue hard sales qualification on that turn.`,
+
+  /** Spoken when generation fails. */
+  fallbackSpeech:
+    "I'm sorry, I'm having trouble with that right now. Could you try again?",
+
+  /**
+   * Opening line forced once via requestGreeting.
+   * Placeholders: {greeting}, {chatbotName}, {helpWhen}
+   */
+  greetingTemplate:
+    '{greeting}! This is {chatbotName} from JPLoft. How can I help you {helpWhen}?',
+
+  /**
+   * Instruction wrapper around greetingTemplate for Live text turn.
+   * Placeholder: {openingLine}
+   */
+  greetingInstructionTemplate:
+    'The phone call just connected. Speak a brief opening only: "{openingLine}" Do not add anything else.',
+
+  /**
+   * Deterministic company answers (pattern strings → RegExp at load).
+   * Each pattern is a JS regex source without delimiters; flags default to "i".
+   */
+  quickFacts: [
+    {
+      id: 'ceo',
+      patterns: [
+        '\\b(who\\s+is|who\'s)\\s+(the\\s+)?(ceo|founder)\\b',
+        '\\b(ceo|founder)\\s+of\\s+jploft\\b',
+        '\\btell\\s+me\\s+about\\s+(the\\s+)?(ceo|founder|rahul)\\b',
+        '\\brahul\\s+sukhwal\\b',
+      ],
+      answer:
+        'Rahul Sukhwal is the Founder, Director and CEO of JPLoft. He has over 18 years of industry experience and has grown the company from a startup into a global software development company.',
+    },
+    {
+      id: 'cto',
+      patterns: [
+        '\\b(who\\s+is|who\'s)\\s+(the\\s+)?cto\\b',
+        '\\bcto\\s+of\\s+jploft\\b',
+        '\\btell\\s+me\\s+about\\s+(the\\s+)?(cto|yashwant)\\b',
+        '\\byashwant\\s+sharma\\b',
+      ],
+      answer:
+        "Yashwant Sharma is the Chief Technology Officer of JPLoft. He has over 14 years of industry experience and brings strong technical expertise and leadership to the company. He is responsible for overseeing the development and implementation of cutting-edge technologies, helping ensure JPLoft's solutions remain scalable and secure.",
+    },
+    {
+      id: 'whatWeDo',
+      patterns: [
+        '\\bwhat\\s+(does|do)\\s+jploft\\s+do\\b',
+        '\\bwhat\\s+is\\s+jploft\\b',
+        '\\btell\\s+me\\s+about\\s+jploft\\b',
+        '\\bwhat\\s+services\\s+(do\\s+you|does\\s+jploft)\\s+offer\\b',
+      ],
+      answer:
+        'JPLoft builds custom software, mobile apps, web platforms, AI solutions, SaaS products, and enterprise systems for businesses.',
+    },
+    {
+      id: 'jaipur',
+      patterns: [
+        '\\b(where\\s+is|what\'s|what\\s+is)\\s+(your\\s+)?jaipur\\s+(office|center|centre|location)\\b',
+        '\\bjaipur\\s+(office|development\\s+center|address)\\b',
+        '\\b(office|address)\\s+in\\s+jaipur\\b',
+      ],
+      answer:
+        'Our Jaipur Development Center is at E-191 C, RIICO Industrial Area, Mansarovar, Jaipur, Rajasthan. It is a development center, not our headquarters.',
+    },
+    {
+      id: 'hq',
+      patterns: [
+        '\\bwhere\\s+(is|are)\\s+(jploft|you)\\s+(headquartered|based)\\b',
+        '\\b(head\\s*office|headquarters|hq)\\b',
+        '\\bprimary\\s+office\\b',
+      ],
+      answer:
+        "JPLoft's primary office is in Denver at 700 North Colorado Boulevard, Suite 200. Our Jaipur location is a development center.",
+    },
+  ],
+
+  /**
+   * Project-inquiry detector: if matched (and not a leadership/location ask),
+   * skip quick-facts so Live free-form handles consultative turns.
+   */
+  projectInquiryPattern:
+    '\\b(build|need|want|looking for|develop|create|hire|project|platform|app|website|saas|integration|estimate|budget|timeline)\\b',
+
+  /**
+   * Wait / hold phrases as full-line regex sources (flags: i).
+   * Also keep waitIntent.js heuristic helpers for short compounds.
+   */
+  waitPatterns: [
+    '^\\s*(wait[.!]?\\s*)+$',
+    '^\\s*hold\\s+on[.!]?\\s*$',
+    '^\\s*hang\\s+on[.!]?\\s*$',
+    '^\\s*one\\s+second[.!]?\\s*$',
+    '^\\s*one\\s+sec[.!]?\\s*$',
+    '^\\s*just\\s+a\\s+(second|sec|moment|minute|min)[.!]?\\s*$',
+    '^\\s*give\\s+me\\s+a\\s+(second|sec|moment|minute|min)[.!]?\\s*$',
+    '^\\s*hold\\s+please[.!]?\\s*$',
+    '^\\s*please\\s+(wait|hold)[.!]?\\s*$',
+    '^\\s*wait\\s+a\\s+(second|sec|moment|minute|min)[.!]?\\s*$',
+    '^\\s*can\\s+you\\s+(wait|hold)\\b.*$',
+    '^\\s*wait\\s+a\\s+(second|sec|moment|minute|min)[,.]?\\s*(please\\s+)?hold[.!]?\\s*$',
+    '^\\s*hang\\s+on[,.]?\\s*(one|a)?\\s*(second|sec|moment|minute)?[.!]?\\s*$',
+    '^\\s*hold\\s+for\\s+a\\s+(second|sec|moment|minute)[.!]?\\s*$',
+    '^\\s*wait\\s+a\\s+minute[.!]?\\s*$',
+    '^\\s*please\\s+wait[,.]?\\s*(a\\s+)?(second|moment|minute)?[.!]?\\s*$',
+  ],
+
+  resumePatterns: [
+    '^\\s*(okay|ok|alright|all\\s+right)[,.]?\\s*(continue|go\\s+on|proceed)?\\.?\\s*$',
+    '^\\s*continue\\.?\\s*$',
+    '^\\s*go\\s+on\\.?\\s*$',
+    '^\\s*proceed\\.?\\s*$',
+    '^\\s*i(\'?m|\\s+am)\\s+back\\.?\\s*$',
+    '^\\s*ready\\.?\\s*$',
+    '^\\s*you\\s+can\\s+continue\\.?\\s*$',
+    '^\\s*please\\s+continue\\.?\\s*$',
+  ],
+};
