@@ -11,10 +11,15 @@ const { KnowledgeChunk } = require('../models/KnowledgeChunk');
 const { isDatabaseConnected } = require('../config/database');
 const { env } = require('../config/env');
 const embeddingService = require('./embeddingService');
+const knowledgeMemoryIndex = require('./knowledgeMemoryIndex');
 const logger = require('../utils/logger');
 
 const CHUNK_TARGET_CHARS = 1000;
 const CHUNK_OVERLAP_CHARS = 150;
+/** Hard ceiling so a hung embedding run cannot leave the UI on Indexing forever. */
+const INDEX_TIMEOUT_MS = 12 * 60 * 1000;
+/** Only one index rebuild at a time — overlapping Saves/restarts must not double-embed. */
+let indexInFlight = null;
 
 class KnowledgeError extends Error {
   constructor(message, status = 400, code = 'KNOWLEDGE_ERROR') {
@@ -217,7 +222,7 @@ async function createDocument({ title, text, source }) {
  * Safe reindex: build new chunks+embeddings, insert, then delete old chunks.
  * @param {string|import('mongoose').Types.ObjectId} documentId
  */
-async function indexDocument(documentId) {
+async function indexDocumentOnce(documentId) {
   if (!isDatabaseConnected()) {
     throw new KnowledgeError(
       'Unable to index knowledge — database not connected',
@@ -236,51 +241,82 @@ async function indexDocument(documentId) {
   await doc.save();
 
   try {
-    const texts = chunkText(doc.rawText);
-    if (!texts.length) {
-      throw new Error('No chunks produced from document text');
-    }
-
-    const embeddings = await embeddingService.generateEmbeddings(texts);
-    if (embeddings.length !== texts.length) {
-      throw new Error('Embedding count mismatch');
-    }
-    for (let i = 0; i < embeddings.length; i += 1) {
-      if (!Array.isArray(embeddings[i]) || embeddings[i].length === 0) {
-        throw new Error(`Empty embedding at chunk ${i}`);
+    const runIndex = async () => {
+      const texts = chunkText(doc.rawText);
+      if (!texts.length) {
+        throw new Error('No chunks produced from document text');
       }
+
+      logger.info(
+        'KNOWLEDGE',
+        `KNOWLEDGE_INDEX_CHUNKS document=${doc._id} chunks=${texts.length} chars=${String(doc.rawText || '').length}`
+      );
+
+      // Drop previous chunks for this document first so old prompt text cannot
+      // be retrieved while (or if) the new embedding run fails.
+      await KnowledgeChunk.deleteMany({ documentId: doc._id });
+      // Ensure RAM cannot serve stale vectors during rebuild.
+      knowledgeMemoryIndex.invalidate();
+
+      const embeddings = await embeddingService.generateEmbeddings(texts);
+      if (embeddings.length !== texts.length) {
+        throw new Error('Embedding count mismatch');
+      }
+      for (let i = 0; i < embeddings.length; i += 1) {
+        if (!Array.isArray(embeddings[i]) || embeddings[i].length === 0) {
+          throw new Error(`Empty embedding at chunk ${i}`);
+        }
+      }
+
+      const modelName = embeddingService.getEmbeddingModel();
+      const newRows = texts.map((text, index) => ({
+        documentId: doc._id,
+        index,
+        text,
+        embedding: embeddings[index],
+        charCount: text.length,
+      }));
+
+      await KnowledgeChunk.insertMany(newRows);
+
+      doc.status = 'ready';
+      doc.charCount = String(doc.rawText || '').length;
+      doc.embeddingModel = modelName;
+      doc.error = null;
+      await doc.save();
+
+      logger.info(
+        'KNOWLEDGE',
+        `KNOWLEDGE_INDEX_READY document=${doc._id} chunks=${newRows.length} chars=${doc.charCount}`
+      );
+
+      try {
+        await knowledgeMemoryIndex.reloadFromMongo();
+      } catch (reloadErr) {
+        logger.warn(
+          'KNOWLEDGE',
+          `RAM index reload after index failed: ${String(reloadErr.message || reloadErr).slice(0, 160)}`
+        );
+      }
+
+      return doc;
+    };
+
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        reject(
+          new Error(
+            `Indexing timed out after ${Math.round(INDEX_TIMEOUT_MS / 1000)}s — try a smaller prompt or Save again`
+          )
+        );
+      }, INDEX_TIMEOUT_MS);
+    });
+    try {
+      return await Promise.race([runIndex(), timeout]);
+    } finally {
+      clearTimeout(timer);
     }
-
-    const modelName = embeddingService.getEmbeddingModel();
-    const newRows = texts.map((text, index) => ({
-      documentId: doc._id,
-      index,
-      text,
-      embedding: embeddings[index],
-      charCount: text.length,
-    }));
-
-    const oldIds = (
-      await KnowledgeChunk.find({ documentId: doc._id }).select('_id').lean().exec()
-    ).map((c) => c._id);
-
-    await KnowledgeChunk.insertMany(newRows);
-
-    if (oldIds.length) {
-      await KnowledgeChunk.deleteMany({ _id: { $in: oldIds } });
-    }
-
-    doc.status = 'ready';
-    doc.charCount = String(doc.rawText || '').length;
-    doc.embeddingModel = modelName;
-    doc.error = null;
-    await doc.save();
-
-    logger.info(
-      'KNOWLEDGE',
-      `KNOWLEDGE_INDEX_READY document=${doc._id} chunks=${newRows.length} chars=${doc.charCount}`
-    );
-    return doc;
   } catch (error) {
     const safe = String(error.message || 'Indexing failed')
       .replace(/key[=:\s][^\s]+/gi, '[redacted]')
@@ -288,9 +324,66 @@ async function indexDocument(documentId) {
     doc.status = 'failed';
     doc.error = safe;
     await doc.save().catch(() => {});
+    knowledgeMemoryIndex.invalidate();
     logger.error('KNOWLEDGE', `KNOWLEDGE_INDEX_FAILED document=${doc._id}: ${safe}`);
     throw error;
   }
+}
+
+async function indexDocument(documentId) {
+  if (indexInFlight) {
+    logger.info(
+      'KNOWLEDGE',
+      `Index already in flight — waiting instead of starting another (${documentId})`
+    );
+    return indexInFlight;
+  }
+  indexInFlight = indexDocumentOnce(documentId).finally(() => {
+    indexInFlight = null;
+  });
+  return indexInFlight;
+}
+
+/**
+ * After a process restart, docs left in pending/indexing never finish.
+ * Re-queue agent (and any other) interrupted documents from saved rawText.
+ * Does not restore old chunks — rebuilds from current rawText only.
+ */
+async function resumeInterruptedIndexing() {
+  if (!isDatabaseConnected()) {
+    return { resumed: 0 };
+  }
+
+  const stuck = await KnowledgeDocument.find({
+    status: { $in: ['pending', 'indexing'] },
+  })
+    .select('_id source status charCount')
+    .lean()
+    .exec();
+
+  if (!stuck.length) {
+    return { resumed: 0 };
+  }
+
+  logger.warn(
+    'KNOWLEDGE',
+    `Resuming ${stuck.length} interrupted index job(s): ${stuck
+      .map((d) => `${d._id}:${d.status}`)
+      .join(', ')}`
+  );
+
+  for (const row of stuck) {
+    setImmediate(() => {
+      indexDocument(row._id).catch((error) => {
+        logger.error(
+          'KNOWLEDGE',
+          `Resume index failed document=${row._id}: ${error.message}`
+        );
+      });
+    });
+  }
+
+  return { resumed: stuck.length };
 }
 
 async function deleteDocument(documentId) {
@@ -308,6 +401,14 @@ async function deleteDocument(documentId) {
   await KnowledgeChunk.deleteMany({ documentId: doc._id });
   await KnowledgeDocument.deleteOne({ _id: doc._id });
   logger.info('KNOWLEDGE', `deleted document=${doc._id}`);
+  try {
+    await knowledgeMemoryIndex.reloadFromMongo();
+  } catch (reloadErr) {
+    logger.warn(
+      'KNOWLEDGE',
+      `RAM index reload after delete failed: ${String(reloadErr.message || reloadErr).slice(0, 160)}`
+    );
+  }
   return true;
 }
 
@@ -344,7 +445,8 @@ async function getDocument(documentId) {
 
 /**
  * Index (or re-index) the singleton Agent.prompt as the searchable corpus.
- * source:'agent' document; safe swap of chunks; on failure keeps prior ready index.
+ * source:'agent' document; replaces rawText and chunks with NEW prompt only.
+ * Old agent-specific chunks are removed before new ones are inserted.
  * @param {string} text - Full Agent.prompt
  */
 async function indexFromAgentPrompt(text) {
@@ -364,6 +466,9 @@ async function indexFromAgentPrompt(text) {
     );
   }
 
+  // Immediately drop stale RAM/LRU so live calls cannot hit old company text.
+  knowledgeMemoryIndex.invalidate();
+
   // Prefer agent-sourced index; migrate away from file/paste as runtime truth.
   let doc = await KnowledgeDocument.findOne({ source: 'agent' }).exec();
   if (!doc) {
@@ -377,9 +482,7 @@ async function indexFromAgentPrompt(text) {
     });
   }
 
-  const previousRaw = doc.rawText;
-  const previousStatus = doc.status;
-
+  // Full replace of corpus text — never append/merge with previous rawText.
   doc.rawText = trimmed;
   doc.charCount = trimmed.length;
   doc.title = 'Agent prompt index';
@@ -403,27 +506,15 @@ async function indexFromAgentPrompt(text) {
   try {
     logger.info(
       'KNOWLEDGE',
-      `KNOWLEDGE_INDEX_START document=${doc._id} source=agent chars=${trimmed.length}`
+      `KNOWLEDGE_INDEX_START document=${doc._id} source=agent chars=${trimmed.length} replace=true`
     );
     return await indexDocument(doc._id);
   } catch (error) {
-    // Preserve previous ready corpus when re-index fails.
-    doc.rawText = previousRaw;
-    doc.charCount = String(previousRaw || '').length;
-    doc.status =
-      previousStatus === 'ready' || previousStatus === 'indexing'
-        ? previousStatus === 'ready'
-          ? 'ready'
-          : 'failed'
-        : previousStatus || 'failed';
-    if (previousStatus === 'ready') {
-      doc.status = 'ready';
-      doc.error = `Re-index failed; previous index kept. ${String(error.message || '').slice(0, 160)}`;
-    } else {
-      doc.status = 'failed';
-      doc.error = String(error.message || 'Indexing failed').slice(0, 240);
-    }
+    // Keep NEW rawText (replacement already saved). Do not restore old corpus.
+    doc.status = 'failed';
+    doc.error = String(error.message || 'Indexing failed').slice(0, 240);
     await doc.save().catch(() => {});
+    knowledgeMemoryIndex.invalidate();
     throw error;
   }
 }
@@ -474,27 +565,32 @@ async function getStatus() {
 }
 
 /**
+ * Fast path: RAM index (cache → lexical → semantic). Cold index triggers one reload.
  * @param {string} query
- * @param {{ topK?: number, maxChars?: number, minScore?: number }} [options]
+ * @param {{ topK?: number, maxChars?: number, minScore?: number, callSid?: string }} [options]
  */
 async function searchKnowledge(query, options = {}) {
   const q = String(query || '').trim();
   const topK = Math.max(
     1,
-    Number(options.topK) || env.knowledgeTopK || 5
+    Number(options.topK) || env.knowledgeTopK || 3
   );
   const maxChars = Math.max(
     200,
-    Number(options.maxChars) || env.knowledgeMaxChars || 6000
+    Number(options.maxChars) || env.knowledgeMaxChars || 3000
   );
   const minScore = Number(
     options.minScore != null ? options.minScore : env.knowledgeMinScore || 0
   );
+  const callSid = options.callSid;
 
-  const empty = (message) => ({
+  const empty = (message, meta = {}) => ({
     snippets: [],
     usedFallback: false,
     message,
+    path: meta.path || null,
+    durationMs: meta.durationMs != null ? meta.durationMs : null,
+    candidates: meta.candidates != null ? meta.candidates : 0,
   });
 
   if (!q) {
@@ -502,102 +598,37 @@ async function searchKnowledge(query, options = {}) {
   }
 
   try {
-    if (!isDatabaseConnected()) {
-      return empty('Knowledge search is temporarily unavailable.');
-    }
-
-    const readyDocs = await KnowledgeDocument.find({ status: 'ready' })
-      .select('_id title')
-      .lean()
-      .exec();
-    if (!readyDocs.length) {
-      return empty('No relevant knowledge was found.');
-    }
-
-    const titleById = new Map(
-      readyDocs.map((d) => [String(d._id), d.title || 'Untitled'])
-    );
-    const readyIds = readyDocs.map((d) => d._id);
-
-    const queryEmbedding = await embeddingService.generateEmbedding(q);
-
-    const chunks = await KnowledgeChunk.find({ documentId: { $in: readyIds } })
-      .select('text embedding documentId')
-      .lean()
-      .exec();
-
-    if (!chunks.length) {
-      return empty('No relevant knowledge was found.');
-    }
-
-    /** @type {{ text: string, score: number, title: string }[]} */
-    const scored = [];
-    let dimMismatch = 0;
-    for (const chunk of chunks) {
-      const score = cosineSimilarity(queryEmbedding, chunk.embedding);
-      if (score == null) {
-        dimMismatch += 1;
-        continue;
+    if (!knowledgeMemoryIndex.isWarm()) {
+      if (isDatabaseConnected()) {
+        await knowledgeMemoryIndex.reloadFromMongo();
       }
-      if (score < minScore) continue;
-      scored.push({
-        text: chunk.text,
-        score,
-        title: titleById.get(String(chunk.documentId)) || 'Untitled',
+    }
+
+    if (!knowledgeMemoryIndex.isWarm()) {
+      return empty('No relevant knowledge was found.', { path: 'cold' });
+    }
+
+    const result = await knowledgeMemoryIndex.searchLocal(q, {
+      topK,
+      maxChars,
+      minScore,
+      callSid,
+    });
+
+    if (!result.snippets || !result.snippets.length) {
+      return empty(result.message || 'No relevant knowledge was found.', {
+        path: result.path,
+        durationMs: result.durationMs,
+        candidates: result.candidates,
       });
-    }
-    if (dimMismatch > 0) {
-      logger.warn(
-        'KNOWLEDGE',
-        `cosine skipped mismatched/empty vectors count=${dimMismatch}`
-      );
-    }
-
-    scored.sort((a, b) => b.score - a.score);
-
-    /** @type {{ text: string, score: number, title: string }[]} */
-    const selected = [];
-    const seenNorm = new Set();
-    let totalChars = 0;
-
-    for (const item of scored) {
-      if (selected.length >= topK) break;
-      const norm = item.text.replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 200);
-      if (seenNorm.has(norm)) continue;
-      if (totalChars + item.text.length > maxChars && selected.length > 0) {
-        continue;
-      }
-      if (item.text.length > maxChars && selected.length === 0) {
-        selected.push({
-          ...item,
-          text: item.text.slice(0, maxChars),
-        });
-        totalChars += maxChars;
-        break;
-      }
-      seenNorm.add(norm);
-      selected.push(item);
-      totalChars += item.text.length;
-    }
-
-    const preview = q.slice(0, 100);
-    const topScore = selected[0] ? selected[0].score : 0;
-    logger.info(
-      'KNOWLEDGE',
-      `KNOWLEDGE_SEARCH query="${preview}" hits=${selected.length} topScore=${topScore.toFixed(3)}`
-    );
-
-    if (!selected.length) {
-      return empty('No relevant knowledge was found.');
     }
 
     return {
-      snippets: selected.map((s) => ({
-        title: s.title,
-        score: Math.round(s.score * 1000) / 1000,
-        text: s.text,
-      })),
+      snippets: result.snippets,
       usedFallback: false,
+      path: result.path,
+      durationMs: result.durationMs,
+      candidates: result.candidates,
     };
   } catch (error) {
     logger.error(
@@ -618,6 +649,8 @@ module.exports = {
   createDocument,
   indexDocument,
   indexFromAgentPrompt,
+  resumeInterruptedIndexing,
+  INDEX_TIMEOUT_MS,
   deleteDocument,
   listDocuments,
   getDocument,

@@ -12,6 +12,8 @@ const mediaStream = require('./websocket/mediaStream');
 const conversationRelay = require('./websocket/conversationRelay');
 const dashboardSocket = require('./websocket/dashboardSocket');
 const liveCallSession = require('./services/liveCallSession');
+const knowledgeMemoryIndex = require('./services/knowledgeMemoryIndex');
+const knowledgeService = require('./services/knowledgeService');
 const { migrateOnceIfEmpty } = require('./services/agentBootstrap');
 const logger = require('./utils/logger');
 
@@ -64,6 +66,33 @@ async function start() {
     logger.warn('AGENT', `Optional seed skipped: ${error.message}`);
   }
   // Knowledge index is built from Agent.prompt on Save — not from company.txt.
+  try {
+    const ram = await knowledgeMemoryIndex.reloadFromMongo();
+    logger.info(
+      'KNOWLEDGE',
+      `Startup RAM index chunks=${ram && ram.chunkCount != null ? ram.chunkCount : 0}`
+    );
+  } catch (error) {
+    logger.warn(
+      'KNOWLEDGE',
+      `Startup RAM index load skipped: ${error.message}`
+    );
+  }
+  // Process restart leaves Mongo status=indexing with no worker — resume from rawText.
+  try {
+    const resume = await knowledgeService.resumeInterruptedIndexing();
+    if (resume && resume.resumed > 0) {
+      logger.info(
+        'KNOWLEDGE',
+        `Startup resumed ${resume.resumed} interrupted index job(s)`
+      );
+    }
+  } catch (error) {
+    logger.warn(
+      'KNOWLEDGE',
+      `Startup index resume skipped: ${error.message}`
+    );
+  }
 
   await new Promise((resolve, reject) => {
     server.once('error', (error) => {

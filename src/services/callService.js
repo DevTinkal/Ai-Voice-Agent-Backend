@@ -4,9 +4,63 @@ const { Call } = require('../models/Call');
 const { isDatabaseConnected } = require('../config/database');
 const logger = require('../utils/logger');
 
+/** Twilio CallSid: CA + 32 hex chars. Rejects probe/test IDs like CAprobe. */
+const TWILIO_CALL_SID_RE = /^CA[0-9a-fA-F]{32}$/;
+
+/** Active calls with no activity past this age are closed (orphaned probes / dropped media). */
+const STALE_ACTIVE_MS = 10 * 60 * 1000;
+
+function isValidTwilioCallSid(callSid) {
+  return typeof callSid === 'string' && TWILIO_CALL_SID_RE.test(callSid);
+}
+
+async function closeStaleActiveCalls() {
+  if (!isDatabaseConnected()) {
+    return 0;
+  }
+  const cutoff = new Date(Date.now() - STALE_ACTIVE_MS);
+  try {
+    const result = await Call.updateMany(
+      {
+        status: { $in: ['incoming', 'connected', 'in-progress'] },
+        $or: [
+          { lastActivityAt: { $lt: cutoff } },
+          {
+            lastActivityAt: null,
+            startedAt: { $lt: cutoff },
+          },
+        ],
+      },
+      {
+        $set: {
+          status: 'failed',
+          endedAt: new Date(),
+          lastActivityAt: new Date(),
+        },
+      }
+    );
+    const n = result.modifiedCount || 0;
+    if (n > 0) {
+      logger.info('CALL', `Closed ${n} stale active call(s)`);
+    }
+    return n;
+  } catch (error) {
+    logger.error('CALL', `Failed to close stale calls: ${error.message}`);
+    return 0;
+  }
+}
+
 async function createCall(data) {
   if (!isDatabaseConnected()) {
     logger.warn('CALL', 'Cannot create call — database unavailable');
+    return null;
+  }
+
+  if (!isValidTwilioCallSid(data.callSid)) {
+    logger.warn(
+      'CALL',
+      `Ignoring non-Twilio CallSid (probe/test?): ${data.callSid}`
+    );
     return null;
   }
 
@@ -139,7 +193,10 @@ async function getRecentCalls(limit = 20) {
   const safeLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
 
   try {
-    return await Call.find({})
+    await closeStaleActiveCalls();
+    return await Call.find({
+      callSid: { $regex: TWILIO_CALL_SID_RE },
+    })
       .sort({ createdAt: -1 })
       .limit(safeLimit)
       .lean();
@@ -163,20 +220,27 @@ async function getCallStatistics() {
   }
 
   try {
+    await closeStaleActiveCalls();
     const startOfDay = new Date();
     startOfDay.setHours(0, 0, 0, 0);
+    const realCallFilter = { callSid: { $regex: TWILIO_CALL_SID_RE } };
 
     const [totalCalls, activeCalls, completedCalls, failedCalls, callsToday] =
       await Promise.all([
-        Call.countDocuments({}),
+        Call.countDocuments(realCallFilter),
         Call.countDocuments({
+          ...realCallFilter,
           status: { $in: ['incoming', 'connected', 'in-progress'] },
         }),
-        Call.countDocuments({ status: 'completed' }),
+        Call.countDocuments({ ...realCallFilter, status: 'completed' }),
         Call.countDocuments({
+          ...realCallFilter,
           status: { $in: ['failed', 'busy', 'no-answer'] },
         }),
-        Call.countDocuments({ createdAt: { $gte: startOfDay } }),
+        Call.countDocuments({
+          ...realCallFilter,
+          createdAt: { $gte: startOfDay },
+        }),
       ]);
 
     return {
@@ -210,6 +274,8 @@ async function touchActivity(callSid) {
 }
 
 module.exports = {
+  isValidTwilioCallSid,
+  closeStaleActiveCalls,
   createCall,
   updateCallStatus,
   markAnswered,

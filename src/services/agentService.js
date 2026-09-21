@@ -3,6 +3,7 @@
 const { Agent } = require('../models/Agent');
 const { isDatabaseConnected } = require('../config/database');
 const knowledgeService = require('./knowledgeService');
+const knowledgeMemoryIndex = require('./knowledgeMemoryIndex');
 const logger = require('../utils/logger');
 
 /**
@@ -10,6 +11,12 @@ const logger = require('../utils/logger');
  * never to the stored Agent.prompt corpus size.
  */
 const MAX_LIVE_SYSTEM_INSTRUCTION_CHARS = 100000;
+
+/**
+ * MongoDB BSON document limit is 16 MiB. Guard Agent.prompt writes below that
+ * so saves fail with a clear storage error (not a Live/Gemini limit).
+ */
+const MAX_AGENT_PROMPT_MONGO_BYTES = 14 * 1024 * 1024;
 
 class AgentConfigError extends Error {
   constructor(message, status = 400, code = 'AGENT_CONFIG_ERROR') {
@@ -228,6 +235,15 @@ async function requireAgentForCall() {
 }
 
 function scheduleAgentPromptIndex(promptText) {
+  // Drop stale RAM/LRU before async rebuild so the next call cannot hit old text.
+  try {
+    knowledgeMemoryIndex.invalidate();
+  } catch (error) {
+    logger.warn(
+      'KNOWLEDGE',
+      `RAM invalidate on prompt save failed: ${error.message}`
+    );
+  }
   setImmediate(() => {
     knowledgeService.indexFromAgentPrompt(promptText).catch((error) => {
       logger.error(
@@ -300,7 +316,17 @@ async function updateAgent({ name, status, languages, prompt }) {
     if (!trimmedPrompt) {
       throw new AgentConfigError('Prompt text is required', 400, 'PROMPT_REQUIRED');
     }
+    const byteLen = Buffer.byteLength(trimmedPrompt, 'utf8');
+    if (byteLen > MAX_AGENT_PROMPT_MONGO_BYTES) {
+      throw new AgentConfigError(
+        `Agent prompt is too large for a single MongoDB document (${byteLen} bytes). MongoDB BSON limit is 16 MiB; keep under ~14 MiB or split storage. This is a database storage limit, not a Gemini Live limit.`,
+        400,
+        'PROMPT_TOO_LARGE_FOR_MONGO'
+      );
+    }
+    // True replacement: single prompts entry = latest textarea only (no append/merge).
     agent.prompts = [{ text: trimmedPrompt }];
+    agent.markModified('prompts');
     promptChanged = true;
   }
   await agent.save();
@@ -347,6 +373,7 @@ async function getAgentById(agentId) {
 module.exports = {
   AgentConfigError,
   MAX_LIVE_SYSTEM_INSTRUCTION_CHARS,
+  MAX_AGENT_PROMPT_MONGO_BYTES,
   serializeAgent,
   normalizeLanguages,
   buildLanguagePolicy,

@@ -101,6 +101,13 @@ async function startOutboundCall(req, res) {
       twimlUrl,
     });
 
+    if (!callService.isValidTwilioCallSid(created.callSid)) {
+      return res.status(502).json({
+        error: 'Twilio returned an invalid CallSid',
+        code: 'INVALID_CALL_SID',
+      });
+    }
+
     await callService.createCall({
       callSid: created.callSid,
       from: created.from,

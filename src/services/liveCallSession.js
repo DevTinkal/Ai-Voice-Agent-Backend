@@ -7,6 +7,7 @@ const { isDatabaseConnected } = require('../config/database');
 const callService = require('./callService');
 const agentService = require('./agentService');
 const knowledgeService = require('./knowledgeService');
+const { env } = require('../config/env');
 const dashboardSocket = require('../websocket/dashboardSocket');
 const geminiLiveService = require('./geminiLiveService');
 const { isWaitHold, isResume } = require('../utils/waitIntent');
@@ -208,7 +209,7 @@ function maybeLogLatencyBreakdown(session) {
 
   session.latencyBreakdownLogged = true;
   const message =
-    `call=${session.callSid} turn=${session.latencyTurnSeq} user_stop_to_gemini_turn_complete=${user_stop_to_gemini_turn_complete}ms gemini_turn_complete_to_first_audio=${gemini_turn_complete_to_first_audio}ms first_audio_to_twilio_send=${first_audio_to_twilio_send}ms TOTAL_user_stop_to_twilio_send=${TOTAL_user_stop_to_twilio_send}ms`;
+    `call=${session.callSid} turn=${session.latencyTurnSeq} model=${env.geminiLiveModel} user_stop_to_gemini_turn_complete=${user_stop_to_gemini_turn_complete}ms gemini_turn_complete_to_first_audio=${gemini_turn_complete_to_first_audio}ms first_audio_to_twilio_send=${first_audio_to_twilio_send}ms TOTAL_user_stop_to_twilio_send=${TOTAL_user_stop_to_twilio_send}ms`;
   logger.info('LATENCY_BREAKDOWN', message);
   appendLatencyLogLine(
     `${new Date(nowMs()).toISOString()} LATENCY_BREAKDOWN ${message}`
@@ -562,13 +563,17 @@ async function handleLiveToolCalls(session, functionCalls) {
       const query =
         (call.args && (call.args.query || call.args.q)) || '';
       const result = await knowledgeService.searchKnowledge(String(query), {
-        topK: 5,
-        maxChars: 6000,
+        topK: env.knowledgeTopK,
+        maxChars: env.knowledgeMaxChars,
+        callSid: session.callSid,
       });
       const hits = (result.snippets && result.snippets.length) || 0;
+      const path = result.path || 'unknown';
+      const durationMs =
+        result.durationMs != null ? result.durationMs : '-';
       logger.info(
         'LIVE',
-        `LIVE_TOOL name=searchKnowledge hits=${hits} callSid=${session.callSid}`
+        `LIVE_TOOL name=searchKnowledge model=${env.geminiLiveModel} callSid=${session.callSid} path=${path} duration_ms=${durationMs} hits=${hits}`
       );
       responses.push({
         id,

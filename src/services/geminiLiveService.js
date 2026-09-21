@@ -138,12 +138,14 @@ function buildLiveConfig(options = {}) {
     },
     // Long-call: enable resumption tokens; pass handle when reconnecting.
     sessionResumption,
-    // Knowledge RAG — synchronous Live function calling (model waits for tool response).
+    // Knowledge RAG — Phase 1: explicit BLOCKING so 3.8 waits for tool response
+    // (3.8 defaults to async/NON_BLOCKING). Do not add thinkingConfig (unsupported on 3.8 Live).
     tools: [
       {
         functionDeclarations: [
           {
             name: 'searchKnowledge',
+            behavior: 'BLOCKING',
             description:
               'Search the company knowledge base for facts relevant to the caller question.',
             parameters: {
@@ -186,6 +188,21 @@ async function connectLiveSession(handlers) {
   });
 
   logger.info('LIVE', `Connecting Gemini Live model=${model}`);
+  const searchDecl =
+    config.tools &&
+    config.tools[0] &&
+    config.tools[0].functionDeclarations &&
+    config.tools[0].functionDeclarations[0];
+  logger.info(
+    'LIVE',
+    `tool searchKnowledge behavior=${
+      (searchDecl && searchDecl.behavior) || 'unset'
+    } thinkingConfig=${
+      Object.prototype.hasOwnProperty.call(config, 'thinkingConfig')
+        ? 'present'
+        : 'absent'
+    }`
+  );
   logger.info(
     'LIVE',
     `VAD config=${JSON.stringify(config.realtimeInputConfig)}`

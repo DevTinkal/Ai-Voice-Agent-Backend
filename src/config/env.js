@@ -34,7 +34,7 @@ const env = {
   geminiApiKey: process.env.GEMINI_API_KEY || '',
   geminiModel: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
   geminiLiveModel:
-    process.env.GEMINI_LIVE_MODEL || 'gemini-3.1-flash-live-preview',
+    process.env.GEMINI_LIVE_MODEL || 'gemini-3.8-live',
   geminiLiveVoice: process.env.GEMINI_LIVE_VOICE || 'Aoede',
   /** Never use text-embedding-004 (shutdown Jan 2026). */
   geminiEmbeddingModel:
@@ -43,8 +43,8 @@ const env = {
   geminiEmbeddingDimensions:
     Number(process.env.GEMINI_EMBEDDING_DIMENSIONS) || 768,
   knowledgeMinScore: Number(process.env.KNOWLEDGE_MIN_SCORE) || 0,
-  knowledgeTopK: Number(process.env.KNOWLEDGE_TOP_K) || 5,
-  knowledgeMaxChars: Number(process.env.KNOWLEDGE_MAX_CHARS) || 6000,
+  knowledgeTopK: Number(process.env.KNOWLEDGE_TOP_K) || 3,
+  knowledgeMaxChars: Number(process.env.KNOWLEDGE_MAX_CHARS) || 3000,
   /**
    * Absolute or backend-relative path to the single knowledge source file.
    * Default: backend/knowledge/company.txt

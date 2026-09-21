@@ -17,6 +17,7 @@ describe('agent prompt as sole knowledge corpus', () => {
       status: 'active',
       languages: ['English'],
       prompts: [{ text: 'old one' }, { text: 'old two' }],
+      markModified() {},
       save: async function save() {
         return this;
       },
@@ -42,6 +43,70 @@ describe('agent prompt as sole knowledge corpus', () => {
 
     await new Promise((r) => setImmediate(r));
     assert.equal(indexed, huge);
+  });
+
+  it('updateAgent A→B→C leaves only latest prompt text (true replace)', async () => {
+    const agentDoc = {
+      name: 'Deep',
+      status: 'active',
+      languages: ['English'],
+      prompts: [{ text: 'OLD_TEST_COMPANY_12345' }],
+      markModified() {},
+      save: async function save() {
+        return this;
+      },
+    };
+    mock.method(agentService, 'getSingletonAgent', async () => agentDoc);
+    const indexed = [];
+    mock.method(knowledgeService, 'indexFromAgentPrompt', async (text) => {
+      indexed.push(text);
+      return { status: 'ready' };
+    });
+
+    await agentService.updateAgent({ prompt: 'OLD_TEST_COMPANY_12345' });
+    await agentService.updateAgent({ prompt: 'NEW_TEST_COMPANY_67890' });
+    await agentService.updateAgent({ prompt: 'VERSION_C_ONLY_999' });
+
+    assert.equal(agentDoc.prompts.length, 1);
+    assert.equal(agentDoc.prompts[0].text, 'VERSION_C_ONLY_999');
+    assert.doesNotMatch(agentDoc.prompts[0].text, /OLD_TEST_COMPANY_12345/);
+    assert.doesNotMatch(agentDoc.prompts[0].text, /NEW_TEST_COMPANY_67890/);
+
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    assert.equal(indexed[indexed.length - 1], 'VERSION_C_ONLY_999');
+    assert.ok(!indexed[indexed.length - 1].includes('OLD_TEST_COMPANY_12345'));
+  });
+
+  it('prompt save invalidates RAM index so old chunks are not searchable', async () => {
+    const knowledgeMemoryIndex = require('../src/services/knowledgeMemoryIndex');
+    knowledgeMemoryIndex.loadSnapshotForTests([
+      {
+        title: 'Old',
+        text: 'OLD_TEST_COMPANY_12345 franchise pricing',
+        embedding: [1, 0, 0],
+      },
+    ]);
+    assert.equal(knowledgeMemoryIndex.isWarm(), true);
+
+    const agentDoc = {
+      name: 'Deep',
+      status: 'active',
+      languages: ['English'],
+      prompts: [{ text: 'OLD_TEST_COMPANY_12345' }],
+      markModified() {},
+      save: async function save() {
+        return this;
+      },
+    };
+    mock.method(agentService, 'getSingletonAgent', async () => agentDoc);
+    mock.method(knowledgeService, 'indexFromAgentPrompt', async () => ({
+      status: 'ready',
+    }));
+
+    await agentService.updateAgent({ prompt: 'NEW_TEST_COMPANY_67890' });
+    assert.equal(knowledgeMemoryIndex.isWarm(), false);
   });
 
   it('buildAgentSystemInstruction is thin — never includes Agent.prompt body', () => {

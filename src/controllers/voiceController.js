@@ -117,6 +117,11 @@ async function handleIncomingCall(req, res) {
       return res.status(400).send('Bad Request');
     }
 
+    if (!callService.isValidTwilioCallSid(callSid)) {
+      logger.warn('TWILIO', `Ignoring non-Twilio CallSid on /voice: ${callSid}`);
+      return res.status(400).send('Bad Request');
+    }
+
     const agentGate = await resolveAgentOrFailTwiml();
     if (!agentGate.ok) {
       res.type('text/xml');
@@ -185,6 +190,14 @@ async function handleOutboundTwiml(req, res) {
 
     if (!callSid) {
       logger.warn('TWILIO', 'Missing CallSid on outbound TwiML');
+      return res.status(400).send('Bad Request');
+    }
+
+    if (!callService.isValidTwilioCallSid(callSid)) {
+      logger.warn(
+        'TWILIO',
+        `Ignoring non-Twilio CallSid on /voice/outbound: ${callSid}`
+      );
       return res.status(400).send('Bad Request');
     }
 

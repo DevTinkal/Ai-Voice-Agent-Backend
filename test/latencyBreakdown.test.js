@@ -73,7 +73,7 @@ describe('LATENCY_BREAKDOWN', () => {
       assert.ok(breakdown);
       assert.match(
         breakdown.message,
-        /call=CA_LAT turn=1 user_stop_to_gemini_turn_complete=350ms gemini_turn_complete_to_first_audio=750ms first_audio_to_twilio_send=40ms TOTAL_user_stop_to_twilio_send=1140ms/
+        /call=CA_LAT turn=1 model=\S+ user_stop_to_gemini_turn_complete=350ms gemini_turn_complete_to_first_audio=750ms first_audio_to_twilio_send=40ms TOTAL_user_stop_to_twilio_send=1140ms/
       );
       assertAbcEqualsTotal(breakdown.message);
 
