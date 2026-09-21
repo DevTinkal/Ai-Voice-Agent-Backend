@@ -11,23 +11,8 @@ function createApp() {
   const app = express();
 
   app.use(helmet());
-  app.use(
-    cors({
-      origin(origin, callback) {
-        if (!origin) {
-          return callback(null, true);
-        }
-        const allowed =
-          /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin) ||
-          /^http:\/\/192\.168\.\d{1,3}\.\d{1,3}(:\d+)?$/i.test(origin) ||
-          /^http:\/\/10\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?$/i.test(origin) ||
-          /^http:\/\/172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}(:\d+)?$/i.test(
-            origin
-          );
-        return callback(null, allowed);
-      },
-    })
-  );
+  // Allow any frontend origin (Vercel, EC2, localhost, future domains).
+  app.use(cors());
 
   app.use(express.urlencoded({ extended: false, limit: '2mb' }));
 
