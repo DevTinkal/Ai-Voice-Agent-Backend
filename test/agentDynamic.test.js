@@ -135,9 +135,35 @@ describe('singleton Agent + Live thin wrapper', () => {
     assert.doesNotMatch(joined, /Prompt one: be helpful/);
     assert.doesNotMatch(joined, /Prompt two: stay concise/);
     assert.match(joined, /LANGUAGE POLICY/);
+    assert.match(joined, /UNDERSTANDING AND CLARIFICATION/);
+    assert.doesNotMatch(joined, /Infer the caller's likely intended meaning/i);
+    assert.match(joined, /CLEAR \+ MEANINGFUL|imperfect English/i);
+    assert.match(joined, /NOISE|BACKGROUND|Prefer silence/i);
+    assert.match(joined, /didn't quite catch that/i);
+    assert.match(joined, /NEVER re-greet|Opening greeting only/i);
+    assert.match(joined, /I can only assist in English/i);
+    assert.match(joined, /must NOT trigger a language lecture|must NOT produce replies/i);
+    assert.match(joined, /Confidence before knowledge search/i);
+    assert.match(joined, /DYNAMIC COMPANY KNOWLEDGE/);
+    assert.match(joined, /Search before answering company questions/i);
+    assert.match(joined, /Answer fast and directly/i);
+    assert.match(joined, /Do not hallucinate/i);
+    assert.match(joined, /HARDCODED GENERIC PROTECTION/);
+    assert.match(joined, /always active/i);
+    assert.match(joined, /Lead capture/i);
+    assert.match(joined, /Do not call|opt-out|Do Not Call/i);
+    assert.match(joined, /stop speaking immediately|Never talk over/i);
+    assert.match(joined, /Yeah, absolutely/i);
+    assert.match(joined, /Let me process that information/i);
+    assert.match(joined, /CONVERSATION CONTEXT/);
+    assert.match(joined, /SMALL TALK/);
     assert.match(joined, /searchKnowledge/);
-    assert.match(joined, /English, Hindi/);
-    assert.match(joined, /reply in English by default/i);
+    assert.match(joined, /found=true/i);
+    assert.match(joined, /NOT UNDERSTOOD/i);
+    assert.match(joined, /Always reply in English/i);
+    assert.match(joined, /spoken name.*is dynamic|dynamic from configuration/i);
+    assert.doesNotMatch(joined, /JPLoft|CEO|companyQuickFacts|JuicedFuel|Juiced Fuel|\.txt/i);
+    assert.ok(joined.length < 16000);
 
     const live = buildLiveConfig({ systemInstruction: joined, midCall: false });
     assert.doesNotMatch(String(live.systemInstruction), new RegExp(marker));
@@ -147,13 +173,23 @@ describe('singleton Agent + Live thin wrapper', () => {
       live.tools[0].functionDeclarations[0].name,
       'searchKnowledge'
     );
+    assert.match(
+      String(live.tools[0].functionDeclarations[0].description),
+      /intended meaning|conversational context/i
+    );
     assert.doesNotMatch(String(live.systemInstruction), /Parker/i);
 
     const greet = buildGreetingInstruction();
     assert.doesNotMatch(greet, /Parker|JPLoft/i);
+    assert.match(greet, /agent identity|hello/i);
 
     const tech = buildSystemInstruction(joined);
     assert.doesNotMatch(tech, /Parker/i);
+    assert.match(tech, /useful snippets/i);
+    assert.match(tech, /Background noise|prefer no spoken reply/i);
+    assert.match(tech, /Imperfect but meaningful English/i);
+    assert.match(tech, /Company facts and Agent Prompt|never invent company/i);
+    assert.match(tech, /Genuine caller barge-in|Do-not-call/i);
   });
 
   it('normalizeLanguages parses comma list and defaults English', () => {

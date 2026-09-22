@@ -13,8 +13,13 @@ const embeddingService = require('./embeddingService');
 const logger = require('../utils/logger');
 
 const LRU_MAX = 128;
-/** Minimum lexical score (shared-token fraction) to skip embedding API. */
+/** Minimum lexical score to consider lexical candidates at all. */
 const LEXICAL_THRESHOLD = 0.35;
+/**
+ * Lexical early-exit only when top hit is strong AND query tokens overlap snippets.
+ * Weaker hits fall through to hybrid lexical+semantic merge.
+ */
+const LEXICAL_STRONG_THRESHOLD = 0.55;
 const STOPWORDS = new Set([
   'a',
   'an',
@@ -307,6 +312,84 @@ function selectSnippets(scored, topK, maxChars) {
   }));
 }
 
+/**
+ * True when at least half of content query tokens appear in top snippet texts.
+ * Used to detect weak lexical hits that share a generic token but miss the question.
+ */
+function queryTokensOverlapSnippets(queryTokens, snippets) {
+  if (!queryTokens.length) {
+    return true;
+  }
+  if (!Array.isArray(snippets) || !snippets.length) {
+    return false;
+  }
+  const haystack = snippets
+    .map((s) => String(s.text || '').toLowerCase())
+    .join(' ');
+  let hit = 0;
+  for (const t of queryTokens) {
+    if (haystack.includes(t)) {
+      hit += 1;
+    }
+  }
+  return hit >= Math.ceil(queryTokens.length / 2);
+}
+
+function snippetPreview(snippets, maxLen = 80) {
+  if (!Array.isArray(snippets) || !snippets.length) {
+    return '';
+  }
+  return String(snippets[0].text || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLen);
+}
+
+function mergeScoredByBest(lexicalScored, semanticScored) {
+  const byNorm = new Map();
+  for (const item of [...lexicalScored, ...semanticScored]) {
+    const norm = String(item.text || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase()
+      .slice(0, 200);
+    if (!norm) continue;
+    const prev = byNorm.get(norm);
+    if (!prev || item.score > prev.score) {
+      byNorm.set(norm, item);
+    }
+  }
+  return Array.from(byNorm.values()).sort((a, b) => b.score - a.score);
+}
+
+async function runSemanticRank(query, minScore) {
+  const queryEmbedding = await embeddingService.generateEmbedding(query);
+  const snap = snapshot;
+  const scored = [];
+  let dimMismatch = 0;
+  for (const chunk of snap.chunks) {
+    const score = cosineSimilarity(queryEmbedding, chunk.embedding);
+    if (score == null) {
+      dimMismatch += 1;
+      continue;
+    }
+    if (score < minScore) continue;
+    scored.push({
+      text: chunk.text,
+      score,
+      title: chunk.title,
+    });
+  }
+  if (dimMismatch > 0) {
+    logger.warn(
+      'KNOWLEDGE',
+      `cosine skipped mismatched/empty vectors count=${dimMismatch}`
+    );
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored;
+}
+
 function lexicalRank(queryTokens) {
   const snap = snapshot;
   if (!snap || !snap.chunks.length || !queryTokens.length) {
@@ -350,7 +433,7 @@ function lexicalRank(queryTokens) {
 /**
  * @param {string} query
  * @param {{ topK?: number, maxChars?: number, minScore?: number, callSid?: string }} [options]
- * @returns {Promise<{ snippets: object[], path: string, message?: string, durationMs: number, candidates: number }>}
+ * @returns {Promise<{ snippets: object[], path: string, message?: string, durationMs: number, candidates: number, found: boolean }>}
  */
 async function searchLocal(query, options = {}) {
   const started = Date.now();
@@ -362,16 +445,20 @@ async function searchLocal(query, options = {}) {
 
   function finish(path, snippets, candidates, message) {
     const durationMs = Date.now() - started;
-    const hits = Array.isArray(snippets) ? snippets.length : 0;
+    const list = snippets || [];
+    const hits = list.length;
+    const scores = list.map((s) => s.score).join(',');
+    const preview = snippetPreview(list);
     logger.info(
       'KNOWLEDGE',
-      `KNOWLEDGE_SEARCH call=${callId} path=${path} duration_ms=${durationMs} candidates=${candidates} hits=${hits}`
+      `KNOWLEDGE_SEARCH call=${callId} path=${path} duration_ms=${durationMs} candidates=${candidates} hits=${hits} scores=[${scores}] preview="${preview.replace(/"/g, "'")}"`
     );
     const out = {
-      snippets: snippets || [],
+      snippets: list,
       path,
       durationMs,
       candidates,
+      found: hits > 0,
     };
     if (message) out.message = message;
     return out;
@@ -399,69 +486,75 @@ async function searchLocal(query, options = {}) {
   const lexicalScored = lexicalRank(queryTokens);
   const bestLex = lexicalScored[0] ? lexicalScored[0].score : 0;
   const lexicalCandidates = lexicalScored.length;
+  const lexicalSnippets =
+    bestLex > 0 ? selectSnippets(lexicalScored, topK, maxChars) : [];
+  const overlapOk = queryTokensOverlapSnippets(queryTokens, lexicalSnippets);
+  const strongLexical =
+    bestLex >= LEXICAL_STRONG_THRESHOLD &&
+    overlapOk &&
+    lexicalSnippets.length > 0;
 
-  if (bestLex >= LEXICAL_THRESHOLD) {
-    const snippets = selectSnippets(lexicalScored, topK, maxChars);
-    if (snippets.length) {
-      lruSet(cacheKey, {
-        snippets,
-        path: 'lexical',
-        candidates: lexicalCandidates,
-      });
-      return finish('lexical', snippets, lexicalCandidates);
-    }
-  }
-
-  const queryEmbedding = await embeddingService.generateEmbedding(q);
-  const snap = snapshot;
-  const scored = [];
-  let dimMismatch = 0;
-  for (const chunk of snap.chunks) {
-    const score = cosineSimilarity(queryEmbedding, chunk.embedding);
-    if (score == null) {
-      dimMismatch += 1;
-      continue;
-    }
-    if (score < minScore) continue;
-    scored.push({
-      text: chunk.text,
-      score,
-      title: chunk.title,
+  if (strongLexical) {
+    lruSet(cacheKey, {
+      snippets: lexicalSnippets,
+      path: 'lexical',
+      candidates: lexicalCandidates,
     });
+    return finish('lexical', lexicalSnippets, lexicalCandidates);
   }
-  if (dimMismatch > 0) {
-    logger.warn(
-      'KNOWLEDGE',
-      `cosine skipped mismatched/empty vectors count=${dimMismatch}`
-    );
+
+  const semanticScored = await runSemanticRank(q, minScore);
+  const semanticCandidates = semanticScored.length;
+
+  // Weak/no lexical: semantic only.
+  if (!lexicalSnippets.length || bestLex < LEXICAL_THRESHOLD) {
+    const snippets = selectSnippets(semanticScored, topK, maxChars);
+    if (!snippets.length) {
+      return finish(
+        'semantic',
+        [],
+        semanticCandidates,
+        'No relevant knowledge was found.'
+      );
+    }
+    lruSet(cacheKey, {
+      snippets,
+      path: 'semantic',
+      candidates: semanticCandidates,
+    });
+    return finish('semantic', snippets, semanticCandidates);
   }
-  scored.sort((a, b) => b.score - a.score);
-  const semanticCandidates = scored.length;
-  const snippets = selectSnippets(scored, topK, maxChars);
+
+  // Weak lexical or poor token overlap: merge lexical + semantic by score.
+  const merged = mergeScoredByBest(lexicalScored, semanticScored);
+  const snippets = selectSnippets(merged, topK, maxChars);
+  const candidates = Math.max(lexicalCandidates, semanticCandidates, merged.length);
 
   if (!snippets.length) {
     return finish(
-      'semantic',
+      'hybrid',
       [],
-      semanticCandidates,
+      candidates,
       'No relevant knowledge was found.'
     );
   }
 
   lruSet(cacheKey, {
     snippets,
-    path: 'semantic',
-    candidates: semanticCandidates,
+    path: 'hybrid',
+    candidates,
   });
-  return finish('semantic', snippets, semanticCandidates);
+  return finish('hybrid', snippets, candidates);
 }
 
 module.exports = {
   LRU_MAX,
   LEXICAL_THRESHOLD,
+  LEXICAL_STRONG_THRESHOLD,
   tokenize,
   normalizeQueryKey,
   cosineSimilarity,
+  queryTokensOverlapSnippets,
   reloadFromMongo,
   loadSnapshotForTests,
   searchLocal,

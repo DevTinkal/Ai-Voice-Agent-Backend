@@ -52,8 +52,14 @@ const env = {
     String(process.env.SKIP_TWILIO_SIGNATURE || '').toLowerCase() === 'true',
   vadStartSensitivity: process.env.VAD_START_SENSITIVITY || 'HIGH',
   vadEndSensitivity: process.env.VAD_END_SENSITIVITY || 'HIGH',
-  vadPrefixPaddingMs: Number(process.env.VAD_PREFIX_PADDING_MS) || 100,
-  vadSilenceDurationMs: Number(process.env.VAD_SILENCE_DURATION_MS) || 300,
+  vadPrefixPaddingMs: Number(process.env.VAD_PREFIX_PADDING_MS) || 150,
+  vadSilenceDurationMs: Number(process.env.VAD_SILENCE_DURATION_MS) || 500,
+  /** How long a recent barge-in gate accept remains valid for Twilio clear. */
+  bargeInConfirmWindowMs:
+    Number(process.env.BARGE_IN_CONFIRM_MS) || 480,
+  /** Min ms between Twilio clear events on interrupt. */
+  bargeInClearDebounceMs:
+    Number(process.env.BARGE_IN_CLEAR_DEBOUNCE_MS) || 500,
 };
 
 function getVoiceWebhookUrl() {

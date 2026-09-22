@@ -9,6 +9,7 @@ const {
 } = require('../config/env');
 const callService = require('../services/callService');
 const agentService = require('../services/agentService');
+const liveCallSession = require('../services/liveCallSession');
 const dashboardSocket = require('../websocket/dashboardSocket');
 const logger = require('../utils/logger');
 
@@ -200,6 +201,9 @@ async function handleOutboundTwiml(req, res) {
       );
       return res.status(400).send('Bad Request');
     }
+
+    // Instrumentation only: start first-response clock at answer (before Media Stream).
+    liveCallSession.beginFirstResponseTimeline(callSid);
 
     const agentGate = await resolveAgentOrFailTwiml();
     if (!agentGate.ok) {

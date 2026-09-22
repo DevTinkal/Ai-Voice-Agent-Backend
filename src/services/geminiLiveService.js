@@ -64,15 +64,25 @@ function resolveEndSensitivity(value) {
 /**
  * Build verified Gemini Live realtimeInputConfig for phone barge-in.
  * Uses @google/genai v1.52.0 enums only.
+ *
+ * Speech-understanding diagnostics (do NOT blindly change VAD):
+ * Before tuning prefixPaddingMs / silenceDurationMs, inspect real-call logs:
+ *   [VOICE_TURN] + caller_input_transcription — what Gemini heard
+ *   [BARGE_IN_CONFIRMED] / [BARGE_IN_REJECTED] — noise vs real interrupt
+ *   [AI_RESPONSE] / clarification loops — policy vs STT failures
+ * Classify: (A) Gemini STT (B) VAD ends turn early (C) noise-as-speech
+ * (D) clarification policy (E) retrieval (F) generation.
+ * Only change VAD when logs prove early cut-off (partial transcripts mid-sentence).
+ * Defaults: prefixPaddingMs=150, silenceDurationMs=500.
  */
 function buildRealtimeInputConfig() {
   const prefixPaddingMs = Math.max(
     0,
-    Number(env.vadPrefixPaddingMs) || 100
+    Number(env.vadPrefixPaddingMs) || 150
   );
   const silenceDurationMs = Math.max(
     100,
-    Number(env.vadSilenceDurationMs) || 300
+    Number(env.vadSilenceDurationMs) || 500
   );
 
   return {
@@ -147,14 +157,14 @@ function buildLiveConfig(options = {}) {
             name: 'searchKnowledge',
             behavior: 'BLOCKING',
             description:
-              'Search the company knowledge base for facts relevant to the caller question.',
+              'Search the indexed Agent knowledge for facts needed to answer the caller. Pass a concise query that states the caller\'s intended meaning and relevant conversational context (topic, entity, follow-up sense) — not raw filler or noise. Use for company facts, products, services, policies, pricing, procedures, and operating rules. Skip for pure greetings or small talk. The tool returns found plus snippet texts; if found is true and snippets answer the question, speak that answer.',
             parameters: {
               type: 'OBJECT',
               properties: {
                 query: {
                   type: 'STRING',
                   description:
-                    "A concise search query representing the caller's factual question.",
+                    "Concise search query: intended meaning of the caller's question plus short context when it is a follow-up (e.g. prior product or topic).",
                 },
               },
               required: ['query'],

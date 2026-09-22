@@ -97,6 +97,21 @@ function attachMediaStream(server) {
             `Media Stream start callSid=${callSid} streamSid=${streamSid}`
           );
 
+          // Continue first-response timeline from outbound answer when present;
+          // otherwise start clock here (inbound). Instrumentation only.
+          let firstResponseT0 = liveCallSession.getFirstResponseOrigin(callSid);
+          if (firstResponseT0 == null) {
+            firstResponseT0 = liveCallSession.stampFirstResponse(
+              callSid,
+              'twilio_start_received'
+            );
+          } else {
+            liveCallSession.stampFirstResponse(
+              callSid,
+              'twilio_start_received'
+            );
+          }
+
           try {
             await liveCallSession.startLiveCall({
               twilioWs: ws,
@@ -104,6 +119,7 @@ function attachMediaStream(server) {
               streamSid,
               from,
               to,
+              firstResponseT0,
             });
           } catch (error) {
             logger.error(

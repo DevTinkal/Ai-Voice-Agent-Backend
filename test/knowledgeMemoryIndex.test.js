@@ -186,6 +186,112 @@ describe('knowledgeMemoryIndex — lexical / cache / semantic', () => {
     const total = result.snippets.reduce((n, s) => n + s.text.length, 0);
     assert.ok(total <= 500 + 50);
   });
+
+  it('strong lexical stays lexical without embedding', async () => {
+    let embedCalls = 0;
+    mock.method(embeddingService, 'generateEmbedding', async () => {
+      embedCalls += 1;
+      return [0, 1, 0];
+    });
+    knowledgeMemoryIndex.loadSnapshotForTests([
+      {
+        title: 'Fee',
+        text: 'The franchise fee is forty thousand dollars including training.',
+        embedding: [0, 1, 0],
+      },
+      {
+        title: 'Noise',
+        text: 'Unrelated aquarium maintenance tips for tropical fish.',
+        embedding: [1, 0, 0],
+      },
+    ]);
+    const result = await knowledgeMemoryIndex.searchLocal(
+      'What is the franchise fee?',
+      { topK: 3, maxChars: 3000 }
+    );
+    assert.equal(result.path, 'lexical');
+    assert.equal(result.found, true);
+    assert.equal(embedCalls, 0);
+    assert.match(result.snippets[0].text, /forty thousand/i);
+  });
+
+  it('weak lexical score merges with semantic (hybrid)', async () => {
+    let embedCalls = 0;
+    mock.method(embeddingService, 'generateEmbedding', async () => {
+      embedCalls += 1;
+      return [1, 0, 0];
+    });
+
+    // 2/4 query tokens in WeakHit → score 0.5 (< 0.55 strong threshold) → hybrid merge.
+    knowledgeMemoryIndex.loadSnapshotForTests([
+      {
+        title: 'WeakHit',
+        text: 'Notes about alpha and beta scheduling only.',
+        embedding: [0, 1, 0],
+      },
+      {
+        title: 'TrueAnswer',
+        text: 'BEGIN_SECTION Marker: gamma and delta warranty lasts twenty four months.',
+        embedding: [1, 0, 0],
+      },
+    ]);
+
+    const result = await knowledgeMemoryIndex.searchLocal(
+      'alpha beta gamma delta',
+      { topK: 3, maxChars: 3000 }
+    );
+    assert.ok(embedCalls >= 1);
+    assert.equal(result.path, 'hybrid');
+    assert.equal(result.found, true);
+    const joined = result.snippets.map((s) => s.text).join(' ');
+    assert.match(joined, /BEGIN_SECTION|twenty four months|gamma/i);
+  });
+
+  it('multi-section corpus unit fixture: lexical or hybrid can hit begin/middle/end markers', async () => {
+    mock.method(embeddingService, 'generateEmbedding', async () => [0, 1, 0]);
+    knowledgeMemoryIndex.loadSnapshotForTests([
+      {
+        title: 'Begin',
+        text: 'SECTION_BEGIN_MARKER opening policy for new partners.',
+        embedding: [1, 0, 0],
+      },
+      {
+        title: 'Middle',
+        text: 'SECTION_MIDDLE_MARKER training curriculum lasts eight weeks.',
+        embedding: [0, 1, 0],
+      },
+      {
+        title: 'End',
+        text: 'SECTION_END_MARKER renewal paperwork is due annually.',
+        embedding: [0, 0, 1],
+      },
+    ]);
+
+    const begin = await knowledgeMemoryIndex.searchLocal(
+      'SECTION_BEGIN_MARKER opening policy',
+      { topK: 2, maxChars: 2000 }
+    );
+    assert.match(begin.snippets.map((s) => s.text).join(' '), /SECTION_BEGIN_MARKER/);
+
+    knowledgeMemoryIndex.clearCache();
+    mock.method(embeddingService, 'generateEmbedding', async () => [0, 1, 0]);
+    const middle = await knowledgeMemoryIndex.searchLocal(
+      'SECTION_MIDDLE_MARKER training curriculum',
+      { topK: 2, maxChars: 2000 }
+    );
+    assert.match(
+      middle.snippets.map((s) => s.text).join(' '),
+      /SECTION_MIDDLE_MARKER/
+    );
+
+    knowledgeMemoryIndex.clearCache();
+    mock.method(embeddingService, 'generateEmbedding', async () => [0, 0, 1]);
+    const end = await knowledgeMemoryIndex.searchLocal(
+      'SECTION_END_MARKER renewal paperwork',
+      { topK: 2, maxChars: 2000 }
+    );
+    assert.match(end.snippets.map((s) => s.text).join(' '), /SECTION_END_MARKER/);
+  });
 });
 
 describe('Live 3.8 Phase 1 config', () => {

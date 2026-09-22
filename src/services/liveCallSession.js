@@ -20,12 +20,20 @@ const {
 const {
   createSpeechGateState,
   evaluateFrame,
+  isBargeInConfirmed,
 } = require('../utils/speechGate');
 const { buildGreetingInstruction } = require('../config/prompts');
 const logger = require('../utils/logger');
 
 /** @type {Map<string, object>} */
 const sessions = new Map();
+
+/**
+ * Shared first-response timeline across /voice/outbound → Media Stream start.
+ * Instrumentation only — does not affect call behavior.
+ * @type {Map<string, { t0: number, lastAt: number }>}
+ */
+const firstResponseByCall = new Map();
 
 const LATENCY_LOG_PATH = path.join(__dirname, '../../logs/latency-latest.log');
 /** Rate-limit AUDIO_GATE logs per call (ms). */
@@ -93,6 +101,89 @@ function setNowMsForTests(fn) {
 function elapsedMs(session) {
   if (!session || !session.t0) return 0;
   return nowMs() - session.t0;
+}
+
+/**
+ * Temporary first-response latency instrumentation only — no behavior change.
+ * Timeline origin is preferably outbound answer (/voice/outbound); otherwise
+ * Media Stream start. Shared across HTTP webhook → WebSocket via callSid map.
+ * @param {string} callSid
+ * @param {string} step
+ * @returns {number} timeline t0
+ */
+function stampFirstResponse(callSid, step) {
+  const key = String(callSid || '').trim() || '-';
+  const now = nowMs();
+  let state = firstResponseByCall.get(key);
+  if (!state) {
+    state = { t0: now, lastAt: now };
+    firstResponseByCall.set(key, state);
+    logger.info(
+      'FIRST_RESPONSE',
+      `[FIRST_RESPONSE] ${step} callSid=${key} total_ms=0 delta_ms=0`
+    );
+    return state.t0;
+  }
+  const totalMs = Math.max(0, now - state.t0);
+  const deltaMs = Math.max(0, now - state.lastAt);
+  state.lastAt = now;
+  logger.info(
+    'FIRST_RESPONSE',
+    `[FIRST_RESPONSE] ${step} callSid=${key} total_ms=${totalMs} delta_ms=${deltaMs}`
+  );
+  return state.t0;
+}
+
+/**
+ * Start first-response clock at outbound answer (before Media Stream).
+ * @param {string} callSid
+ * @returns {number|null} t0
+ */
+function beginFirstResponseTimeline(callSid) {
+  const key = String(callSid || '').trim();
+  if (!key) {
+    return null;
+  }
+  const t0 = nowMs();
+  firstResponseByCall.set(key, { t0, lastAt: t0 });
+  logger.info(
+    'FIRST_RESPONSE',
+    `[FIRST_RESPONSE] outbound_call_answered callSid=${key} total_ms=0 delta_ms=0`
+  );
+  return t0;
+}
+
+/**
+ * @param {string} callSid
+ * @returns {number|null}
+ */
+function getFirstResponseOrigin(callSid) {
+  const state = firstResponseByCall.get(String(callSid || '').trim());
+  return state ? state.t0 : null;
+}
+
+function clearFirstResponseTimeline(callSid) {
+  if (callSid) {
+    firstResponseByCall.delete(String(callSid));
+  }
+}
+
+/**
+ * @param {object|null} session
+ * @param {string} step
+ * @param {string} [callSidOverride]
+ */
+function logFirstResponse(session, step, callSidOverride) {
+  const callSid =
+    (session && session.callSid) || callSidOverride || '-';
+  const t0 = stampFirstResponse(callSid, step);
+  if (session) {
+    session.t0 = t0;
+    const state = firstResponseByCall.get(String(callSid));
+    if (state) {
+      session.firstResponseLastAt = state.lastAt;
+    }
+  }
 }
 
 /**
@@ -362,6 +453,7 @@ function createEmptySession(callSid, twilioWs, streamSid, from, to) {
     firstTwilioOutAt: null,
     interruptAt: null,
     clearAt: null,
+    lastTwilioClearAt: null,
     lastUserTurnEndAt: null,
     lastSpeechAudioAt: null,
     geminiUserTurnCompleteAt: null,
@@ -378,6 +470,8 @@ function createEmptySession(callSid, twilioWs, streamSid, from, to) {
     turnFirstAudioLogged: false,
     /** Correlates MULTILINGUAL_DEBUG caller/assistant transcript pairs. */
     debugTurnSeq: 0,
+    /** Last [FIRST_RESPONSE] stamp time for delta_ms (instrumentation only). */
+    firstResponseLastAt: null,
   };
 }
 
@@ -424,6 +518,7 @@ function clearTwilioPlayback(session) {
   session.suppressStaleOutput = true;
   session.turnFirstAudioLogged = false;
   session.clearAt = nowMs();
+  session.lastTwilioClearAt = session.clearAt;
   if (!session.twilioWs || session.twilioWs.readyState !== 1 || !session.streamSid) {
     return;
   }
@@ -444,6 +539,67 @@ function clearTwilioPlayback(session) {
     );
   } catch (error) {
     logger.warn('LIVE', `Failed to clear Twilio playback: ${error.message}`);
+  }
+}
+
+/**
+ * Gemini interrupted: clear Twilio only when barge-in is gate-confirmed
+ * (or AI was speaking with an open gate) and clear debounce allows.
+ * Never mutes caller PCM / never sets waiting from noise.
+ */
+function handleGeminiInterrupted(session) {
+  if (!session) {
+    return;
+  }
+  const t = nowMs();
+  session.interruptAt = t;
+  logger.info(
+    'LATENCY',
+    `interrupt_detected call=${session.callSid} t+${elapsedMs(session)}ms`
+  );
+  logger.info('LIVE', `[GEMINI_INTERRUPT] callSid=${session.callSid}`);
+
+  const gate = session.speechGate;
+  const confirmWindow =
+    Number(env.bargeInConfirmWindowMs) || 480;
+  const debounceMs = Number(env.bargeInClearDebounceMs) || 500;
+  const lastClear = Number(session.lastTwilioClearAt) || 0;
+  const withinDebounce = lastClear > 0 && t - lastClear < debounceMs;
+
+  const confirmed = isBargeInConfirmed(gate, {
+    nowMs: t,
+    confirmWindowMs: confirmWindow,
+  });
+  const aiWasSpeaking = Boolean(session.aiSpeaking);
+  const gateOpen = Boolean(gate && gate.open);
+  const shouldClear =
+    !withinDebounce && (confirmed || (aiWasSpeaking && gateOpen));
+
+  if (shouldClear) {
+    logger.info(
+      'LIVE',
+      `[BARGE_IN_CONFIRMED] callSid=${session.callSid} confirmed=${confirmed} aiSpeaking=${aiWasSpeaking} gateOpen=${gateOpen}`
+    );
+    clearTwilioPlayback(session);
+    dashboardSocket.broadcast({
+      type: 'CALL_INTERRUPT',
+      data: { callSid: session.callSid },
+    });
+  } else {
+    logger.info(
+      'LIVE',
+      `[BARGE_IN_REJECTED] callSid=${session.callSid} reason=${
+        withinDebounce ? 'clear_debounce' : 'unconfirmed_noise'
+      } confirmed=${confirmed} aiSpeaking=${aiWasSpeaking} gateOpen=${gateOpen}`
+    );
+    // Still drop stale audio on this interrupted message without a second clear
+    // when debounce already cleared recently; bump generation so late chunks die.
+    if (withinDebounce) {
+      bumpPlaybackGeneration(session);
+      session.suppressStaleOutput = true;
+      session.aiSpeaking = false;
+      session.turnFirstAudioLogged = false;
+    }
   }
 }
 
@@ -478,6 +634,7 @@ function playGeminiPcmOnce(session, pcmBuffer, generationAtEnqueue) {
 
   if (!session.firstGeminiAudioAt) {
     session.firstGeminiAudioAt = nowMs();
+    logFirstResponse(session, 'first_gemini_audio');
   }
   if (!session.turnFirstAudioLogged) {
     // New AI reply turn: never reuse greeting / prior turn Twilio send stamp.
@@ -543,6 +700,7 @@ function playGeminiPcmOnce(session, pcmBuffer, generationAtEnqueue) {
     session.twilioFrameCount = (session.twilioFrameCount || 0) + 1;
     if (!session.firstTwilioOutAt) {
       session.firstTwilioOutAt = nowMs();
+      logFirstResponse(session, 'first_twilio_audio');
       logger.info(
         'LATENCY',
         `twilio_first_out call=${session.callSid} t+${elapsedMs(session)}ms`
@@ -616,23 +774,53 @@ async function handleLiveToolCalls(session, functionCalls) {
   if (name === 'searchKnowledge') {
       const query =
         (call.args && (call.args.query || call.args.q)) || '';
-      const result = await knowledgeService.searchKnowledge(String(query), {
+      const q = String(query).replace(/\s+/g, ' ').trim();
+      logger.info(
+        'LIVE',
+        `[VOICE_TURN] callSid=${session.callSid} tool=searchKnowledge query="${String(q).slice(0, 120).replace(/"/g, "'")}"`
+      );
+      const result = await knowledgeService.searchKnowledge(q, {
         topK: env.knowledgeTopK,
         maxChars: env.knowledgeMaxChars,
         callSid: session.callSid,
       });
-      const hits = (result.snippets && result.snippets.length) || 0;
+      const snippets = Array.isArray(result.snippets) ? result.snippets : [];
+      const hits = snippets.length;
+      const found = Boolean(result.found) && hits > 0;
       const path = result.path || 'unknown';
       const durationMs =
         result.durationMs != null ? result.durationMs : '-';
+      const scores = snippets.map((s) => s.score).join(',');
+      const preview = String((snippets[0] && snippets[0].text) || '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 80)
+        .replace(/"/g, "'");
       logger.info(
         'LIVE',
-        `LIVE_TOOL name=searchKnowledge model=${env.geminiLiveModel} callSid=${session.callSid} path=${path} duration_ms=${durationMs} hits=${hits}`
+        `[LIVE_TOOL] name=searchKnowledge model=${env.geminiLiveModel} callSid=${session.callSid} path=${path} duration_ms=${durationMs} hits=${hits} found=${found}`
       );
+      logger.info(
+        'LIVE',
+        `[KNOWLEDGE_RESULT] callSid=${session.callSid} path=${path} hits=${hits} scores=[${scores}] preview="${preview}"`
+      );
+      const toolPayload = {
+        found,
+        snippets: snippets.map((s) => ({
+          text: String(s.text || ''),
+          score: s.score,
+        })),
+        message: found
+          ? undefined
+          : result.message || 'No relevant knowledge was found.',
+      };
+      if (!toolPayload.message) {
+        delete toolPayload.message;
+      }
       responses.push({
         id,
         name: 'searchKnowledge',
-        response: { result },
+        response: toolPayload,
       });
       continue;
     }
@@ -642,11 +830,9 @@ async function handleLiveToolCalls(session, functionCalls) {
       id,
       name: name || 'unknown',
       response: {
-        result: {
-          snippets: [],
-          usedFallback: false,
-          message: 'Unsupported tool.',
-        },
+        found: false,
+        snippets: [],
+        message: 'Unsupported tool.',
       },
     });
   }
@@ -712,20 +898,7 @@ function handleLiveMessage(session, message, listenerEpoch) {
   }
 
   if (parsed.interrupted) {
-    session.interruptAt = nowMs();
-    logger.info(
-      'LATENCY',
-      `interrupt_detected call=${session.callSid} t+${elapsedMs(session)}ms`
-    );
-    clearTwilioPlayback(session);
-    dashboardSocket.broadcast({
-      type: 'CALL_INTERRUPT',
-      data: { callSid: session.callSid },
-    });
-    logger.info(
-      'LIVE',
-      `[GEMINI_INTERRUPT] callSid=${session.callSid}`
-    );
+    handleGeminiInterrupted(session);
     // Do not play any audio that arrived on the same interrupted message.
     return;
   }
@@ -855,6 +1028,13 @@ async function flushInputTranscript(session) {
     return;
   }
   session.debugTurnSeq = (session.debugTurnSeq || 0) + 1;
+  // Speech-understanding diag: compare this STT side-channel with [AI_RESPONSE],
+  // [BARGE_IN_*], and tool queries before changing VAD (see geminiLiveService
+  // buildRealtimeInputConfig). Partial mid-sentence text ⇒ possible early VAD.
+  logger.info(
+    'LIVE',
+    `[VOICE_TURN] callSid=${session.callSid} turn=${session.debugTurnSeq} caller="${debugTranscriptSnippet(input)}"`
+  );
   // Side-channel only: Live replies from caller AUDIO, not this text.
   logger.info(
     'MULTILINGUAL_DEBUG',
@@ -869,6 +1049,10 @@ async function flushOutputTranscript(session) {
   if (!output || session.waiting) {
     return;
   }
+  logger.info(
+    'LIVE',
+    `[AI_RESPONSE] callSid=${session.callSid} turn=${session.debugTurnSeq || '?'} text="${debugTranscriptSnippet(output)}"`
+  );
   logger.info(
     'MULTILINGUAL_DEBUG',
     `assistant_output_transcription call=${session.callSid} turn=${session.debugTurnSeq || '?'} text="${debugTranscriptSnippet(output)}" note=spoken_reply_side_channel`
@@ -1192,7 +1376,14 @@ async function reconnectLiveSession(session, reason) {
 /**
  * Create / attach exactly one Live call session when Twilio Media Stream starts.
  */
-async function startLiveCall({ twilioWs, callSid, streamSid, from, to }) {
+async function startLiveCall({
+  twilioWs,
+  callSid,
+  streamSid,
+  from,
+  to,
+  firstResponseT0,
+}) {
   if (!callSid) {
     throw new Error('callSid required');
   }
@@ -1207,6 +1398,25 @@ async function startLiveCall({ twilioWs, callSid, streamSid, from, to }) {
     if (from) session.from = from;
     if (to) session.to = to;
   }
+
+  // Align first-response clock with outbound answer or Media Stream start.
+  if (
+    firstResponseT0 != null &&
+    Number.isFinite(Number(firstResponseT0))
+  ) {
+    const t0 = Number(firstResponseT0);
+    session.t0 = t0;
+    if (!firstResponseByCall.has(String(callSid))) {
+      firstResponseByCall.set(String(callSid), {
+        t0,
+        lastAt: session.firstResponseLastAt != null
+          ? session.firstResponseLastAt
+          : t0,
+      });
+    }
+  }
+
+  logFirstResponse(session, 'startLiveCall_started');
 
   // Idempotent: never attach two Gemini Live sessions to one call.
   if (session.connecting || session.reconnecting) {
@@ -1263,9 +1473,12 @@ async function startLiveCall({ twilioWs, callSid, streamSid, from, to }) {
         `agent loaded callSid=${callSid} agent=${session.agentName} promptChars=${session.agentPrompt.length}`
       );
     }
+    logFirstResponse(session, 'agent_loading_completed');
 
     await callService.markAnswered(callSid, streamSid);
+    logFirstResponse(session, 'markAnswered_completed');
     await callService.markInProgress(callSid);
+    logFirstResponse(session, 'markInProgress_completed');
 
     dashboardSocket.broadcast({
       type: 'CALL_CONNECTED',
@@ -1278,10 +1491,12 @@ async function startLiveCall({ twilioWs, callSid, streamSid, from, to }) {
       },
     });
 
+    logFirstResponse(session, 'gemini_connect_started');
     const { liveSession, listenerEpoch } = await openGeminiLiveForCall(
       session,
       'start'
     );
+    logFirstResponse(session, 'gemini_connected');
 
     // Race: call may have ended while connecting.
     if (session.ending || !sessions.has(callSid)) {
@@ -1304,6 +1519,7 @@ async function startLiveCall({ twilioWs, callSid, streamSid, from, to }) {
         liveSession,
         buildGreetingInstruction()
       );
+      logFirstResponse(session, 'greeting_requested');
       logger.info('LIVE', `greeting requested once callSid=${callSid}`);
     }
 
@@ -1339,6 +1555,7 @@ function forwardTwilioMedia(session, payloadBase64) {
     // (incl. quiet frames) so Gemini Live VAD can complete user turns.
     const decision = evaluateFrame(pcm16k, session.speechGate, {
       aiSpeaking: Boolean(session.aiSpeaking),
+      nowMs: nowMs(),
     });
     if (decision.accept) {
       session.speechLabeledCount = (session.speechLabeledCount || 0) + 1;
@@ -1442,6 +1659,7 @@ async function endLiveCall(callSid, reason = 'stop') {
   );
 
   sessions.delete(callSid);
+  clearFirstResponseTimeline(callSid);
 
   const call = await callService.markCompleted(callSid);
   dashboardSocket.broadcast({
@@ -1470,6 +1688,7 @@ module.exports = {
   forwardTwilioMedia,
   endLiveCall,
   clearTwilioPlayback,
+  handleGeminiInterrupted,
   closeAllSessions,
   saveMessage,
   playGeminiPcmOnce,
@@ -1486,5 +1705,8 @@ module.exports = {
   scheduleLiveReconnect,
   LIVE_RECONNECT_MAX_ATTEMPTS,
   LATENCY_LOG_PATH,
+  beginFirstResponseTimeline,
+  getFirstResponseOrigin,
+  stampFirstResponse,
   parseLiveMessageForTests: geminiLiveService.parseLiveMessage,
 };

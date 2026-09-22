@@ -587,7 +587,9 @@ async function getStatus() {
  * @param {{ topK?: number, maxChars?: number, minScore?: number, callSid?: string }} [options]
  */
 async function searchKnowledge(query, options = {}) {
-  const q = String(query || '').trim();
+  const q = String(query || '')
+    .replace(/\s+/g, ' ')
+    .trim();
   const topK = Math.max(
     1,
     Number(options.topK) || env.knowledgeTopK || 3
@@ -604,6 +606,7 @@ async function searchKnowledge(query, options = {}) {
   const empty = (message, meta = {}) => ({
     snippets: [],
     usedFallback: false,
+    found: false,
     message,
     path: meta.path || null,
     durationMs: meta.durationMs != null ? meta.durationMs : null,
@@ -643,6 +646,7 @@ async function searchKnowledge(query, options = {}) {
     return {
       snippets: result.snippets,
       usedFallback: false,
+      found: true,
       path: result.path,
       durationMs: result.durationMs,
       candidates: result.candidates,

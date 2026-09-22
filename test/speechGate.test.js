@@ -71,14 +71,15 @@ describe('speechGate evaluateFrame', () => {
   it('opens sooner when aiSpeaking (barge-in path)', () => {
     const idle = createSpeechGateState();
     const barge = createSpeechGateState();
-    // ~80ms of speech (4 x 20ms) — above barge 70ms, below idle 150ms
-    for (let i = 0; i < 4; i += 1) {
+    // ~120ms of speech (6 x 20ms) — at barge 120ms, still below idle 150ms
+    for (let i = 0; i < 6; i += 1) {
       evaluateFrame(makeSpeechLikePcm16k(), idle, { aiSpeaking: false });
       evaluateFrame(makeSpeechLikePcm16k(), barge, { aiSpeaking: true });
     }
     assert.equal(idle.open, false);
     assert.equal(barge.open, true);
     assert.ok(MIN_OPEN_MS_BARGE_IN < MIN_OPEN_MS_IDLE);
+    assert.equal(MIN_OPEN_MS_BARGE_IN, 120);
     assert.equal(
       evaluateFrame(makeSpeechLikePcm16k(), barge, { aiSpeaking: true }).reason,
       'interruption_accepted'

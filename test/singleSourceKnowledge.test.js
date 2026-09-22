@@ -121,9 +121,19 @@ describe('agent prompt as sole knowledge corpus', () => {
     assert.match(instruction, /spoken name on this call is Deep/);
     assert.match(instruction, /searchKnowledge/);
     assert.match(instruction, /KNOWLEDGE AND INSTRUCTIONS POLICY|KNOWLEDGE/);
+    assert.match(instruction, /SPEECH UNDERSTANDING|UNDERSTANDING AND CLARIFICATION/);
+    assert.match(instruction, /CONVERSATION CONTEXT/);
+    assert.match(instruction, /didn't quite catch that|NOT UNDERSTOOD/i);
+    assert.match(instruction, /NOISE|Prefer silence|background/i);
+    assert.match(instruction, /Opening greeting only|NEVER re-greet/i);
+    assert.match(instruction, /DYNAMIC COMPANY KNOWLEDGE/);
+    assert.match(instruction, /HARDCODED GENERIC PROTECTION/);
+    assert.match(instruction, /always active/i);
+    assert.match(instruction, /Do Not Call|opt-out/i);
     assert.doesNotMatch(instruction, /UNIQUE_FDD_MARKER_NEVER_IN_WRAPPER/);
     assert.doesNotMatch(instruction, /franchise territory royalty/);
-    assert.ok(instruction.length < 5000);
+    assert.doesNotMatch(instruction, /JPLoft|CEO|JuicedFuel/i);
+    assert.ok(instruction.length < 16000);
   });
 
   it('large stored prompt does not throw Live size error', () => {

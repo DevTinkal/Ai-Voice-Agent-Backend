@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const {
   createSpeechGateState,
   shouldForward,
+  evaluateFrame,
   HANGOVER_MS,
 } = require('../src/utils/speechGate');
 const {
@@ -263,8 +264,8 @@ describe('Gemini Live VAD config', () => {
       cfg.automaticActivityDetection.endOfSpeechSensitivity,
       EndSensitivity.END_SENSITIVITY_HIGH
     );
-    assert.equal(cfg.automaticActivityDetection.prefixPaddingMs, 100);
-    assert.equal(cfg.automaticActivityDetection.silenceDurationMs, 300);
+    assert.equal(cfg.automaticActivityDetection.prefixPaddingMs, 150);
+    assert.equal(cfg.automaticActivityDetection.silenceDurationMs, 500);
   });
 
   it('buildLiveConfig includes realtimeInputConfig', () => {
@@ -306,8 +307,18 @@ describe('Gemini Live VAD config', () => {
 });
 
 describe('interrupt stale audio', () => {
-  it('interrupted path clears and suppresses stale generation audio', () => {
+  it('confirmed barge-in clears and suppresses stale generation audio', () => {
     const sent = [];
+    const gate = createSpeechGateState();
+    // Confirm barge-in while AI speaking (~120ms+ speech).
+    for (let i = 0; i < 8; i += 1) {
+      evaluateFrame(makeSpeechLikePcm16k(), gate, {
+        aiSpeaking: true,
+        nowMs: Date.now(),
+      });
+    }
+    assert.equal(gate.open, true);
+
     const session = {
       callSid: 'CA_BARGE',
       streamSid: 'MZ_BARGE',
@@ -321,6 +332,8 @@ describe('interrupt stale audio', () => {
       suppressStaleOutput: false,
       aiSpeaking: true,
       turnFirstAudioLogged: true,
+      speechGate: gate,
+      lastTwilioClearAt: null,
       t0: Date.now(),
       twilioWs: {
         readyState: 1,
@@ -354,6 +367,7 @@ describe('interrupt stale audio', () => {
     assert.ok(session.playbackGeneration > genBefore);
     assert.equal(session.suppressStaleOutput, true);
     assert.equal(session.aiSpeaking, false);
+    assert.equal(session.forwardAudio !== false, true);
     assert.ok(sent.some((m) => m.event === 'clear'));
     // Interrupted message audio must not be played.
     assert.equal(session.geminiChunkCount, 0);
@@ -370,5 +384,82 @@ describe('interrupt stale audio', () => {
     );
     assert.equal(session.geminiChunkCount, 1);
     assert.equal(session.suppressStaleOutput, false);
+  });
+
+  it('unconfirmed noise interrupt does not clear Twilio', () => {
+    const sent = [];
+    const session = {
+      callSid: 'CA_NOISE_INT',
+      streamSid: 'MZ_NOISE',
+      waiting: false,
+      forwardAudio: true,
+      ending: false,
+      liveSessionEpoch: 1,
+      playbackGeneration: 0,
+      geminiChunkCount: 0,
+      outboundRemainder: Buffer.alloc(0),
+      suppressStaleOutput: false,
+      aiSpeaking: true,
+      speechGate: createSpeechGateState(),
+      lastTwilioClearAt: null,
+      t0: Date.now(),
+      twilioWs: {
+        readyState: 1,
+        send(raw) {
+          sent.push(JSON.parse(raw));
+        },
+      },
+    };
+    liveCallSession.handleLiveMessage(
+      session,
+      { serverContent: { interrupted: true } },
+      1
+    );
+    assert.ok(!sent.some((m) => m.event === 'clear'));
+    assert.equal(session.forwardAudio, true);
+    assert.equal(session.waiting, false);
+  });
+
+  it('debounces repeated Twilio clear within window', () => {
+    const sent = [];
+    const gate = createSpeechGateState();
+    for (let i = 0; i < 8; i += 1) {
+      evaluateFrame(makeSpeechLikePcm16k(), gate, {
+        aiSpeaking: true,
+        nowMs: Date.now(),
+      });
+    }
+    const session = {
+      callSid: 'CA_DEB',
+      streamSid: 'MZ_DEB',
+      waiting: false,
+      forwardAudio: true,
+      ending: false,
+      liveSessionEpoch: 1,
+      playbackGeneration: 0,
+      geminiChunkCount: 0,
+      outboundRemainder: Buffer.alloc(0),
+      suppressStaleOutput: false,
+      aiSpeaking: true,
+      turnFirstAudioLogged: true,
+      speechGate: gate,
+      lastTwilioClearAt: null,
+      t0: Date.now(),
+      twilioWs: {
+        readyState: 1,
+        send(raw) {
+          sent.push(JSON.parse(raw));
+        },
+      },
+    };
+    const msg = { serverContent: { interrupted: true } };
+    liveCallSession.handleLiveMessage(session, msg, 1);
+    session.aiSpeaking = true;
+    gate.open = true;
+    gate.lastBargeAcceptAt = Date.now();
+    liveCallSession.handleLiveMessage(session, msg, 1);
+    const clears = sent.filter((m) => m.event === 'clear');
+    assert.equal(clears.length, 1);
+    assert.equal(session.forwardAudio, true);
   });
 });

@@ -143,19 +143,29 @@ describe('knowledge RAG — Live tool wiring', () => {
       {
         id: 'call-1',
         name: 'searchKnowledge',
-        response: { result: { snippets: [], usedFallback: false } },
+        response: {
+          found: false,
+          snippets: [],
+          message: 'No relevant knowledge was found.',
+        },
       },
     ]);
     assert.equal(sent.length, 1);
     assert.equal(sent[0].functionResponses[0].name, 'searchKnowledge');
+    assert.equal(sent[0].functionResponses[0].response.found, false);
   });
 
-  it('handleLiveToolCalls runs searchKnowledge and does not invent QuickFacts', async () => {
+  it('handleLiveToolCalls flattens searchKnowledge to found + snippet texts', async () => {
     mock.method(knowledgeService, 'searchKnowledge', async (query) => {
       assert.match(String(query), /dealer/);
       return {
-        snippets: [{ title: 'Dealer', score: 0.9, text: 'Need ID and tax docs.' }],
+        snippets: [
+          { title: 'Dealer', score: 0.9, text: 'Need ID and tax docs.' },
+        ],
         usedFallback: false,
+        found: true,
+        path: 'lexical',
+        durationMs: 2,
       };
     });
 
@@ -181,8 +191,11 @@ describe('knowledge RAG — Live tool wiring', () => {
     assert.equal(toolPayloads.length, 1);
     const fr = toolPayloads[0].functionResponses[0];
     assert.equal(fr.name, 'searchKnowledge');
-    assert.equal(fr.response.result.usedFallback, false);
-    assert.equal(fr.response.result.snippets[0].title, 'Dealer');
+    assert.equal(fr.response.found, true);
+    assert.ok(Array.isArray(fr.response.snippets));
+    assert.equal(fr.response.snippets[0].text, 'Need ID and tax docs.');
+    assert.equal(fr.response.snippets[0].score, 0.9);
+    assert.equal(fr.response.result, undefined);
     assert.doesNotMatch(
       JSON.stringify(fr),
       /companyQuickFacts|JPLoft Sales Executive/i
@@ -199,9 +212,21 @@ describe('knowledge RAG — Live tool wiring', () => {
     assert.match(instruction, /KNOWLEDGE/);
     assert.match(instruction, /searchKnowledge/);
     assert.match(instruction, /reference material only/i);
+    assert.match(instruction, /SPEECH UNDERSTANDING|UNDERSTANDING AND CLARIFICATION/);
+    assert.match(instruction, /CONVERSATION CONTEXT/);
+    assert.match(instruction, /found=true/i);
+    assert.match(instruction, /NOT UNDERSTOOD/i);
+    assert.match(instruction, /NOISE|Prefer silence|background/i);
+    assert.match(instruction, /imperfect English/i);
+    assert.match(instruction, /Always reply in English/i);
+    assert.match(instruction, /I can only assist in English/i);
+    assert.match(instruction, /DYNAMIC COMPANY KNOWLEDGE/);
+    assert.match(instruction, /HARDCODED GENERIC PROTECTION/);
+    assert.match(instruction, /Answer fast and directly/i);
     assert.doesNotMatch(instruction, /companyQuickFacts/);
     assert.doesNotMatch(instruction, /UNIQUE_NEVER_IN_LIVE/);
-    assert.ok(instruction.length < 8000);
+    assert.doesNotMatch(instruction, /JPLoft|CEO|pricing is|JuicedFuel/i);
+    assert.ok(instruction.length < 16000);
 
     // Stored multi-MB prompt must not trigger Live soft-cap (wrapper only).
     const ok = agentService.assertLivePromptSize({

@@ -29,10 +29,14 @@ describe('phone prompt and env wiring', () => {
       midCall: true,
     });
     assert.match(mid, /MID-CALL/);
+    assert.match(mid, /Do not greet again|Do not re-introduce/i);
+    assert.match(mid, /Background noise|prefer no spoken reply/i);
+    assert.match(mid, /Imperfect but meaningful English/i);
+    assert.match(mid, /Genuine caller barge-in|Do-not-call/i);
     assert.doesNotMatch(mid, /Parker|JPLoft/i);
 
     const greet = buildGreetingInstruction();
-    assert.match(greet, /configured system instructions/i);
+    assert.match(greet, /agent identity|hello/i);
     assert.doesNotMatch(greet, /Parker|JPLoft/i);
 
     assert.ok(FALLBACK_SPEECH.length > 10);

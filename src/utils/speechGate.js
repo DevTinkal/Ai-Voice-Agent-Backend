@@ -4,20 +4,19 @@
  * Speech / noise gate for phone PCM16 @ 16 kHz.
  * Adaptive noise floor + RMS margin + speech-like zero-crossing rate.
  *
- * Used to decide whether real PCM reaches Gemini Live, or silence of the
- * same length is sent instead (keeps stream continuous for Live VAD).
- * This is NOT speaker identification / diarization — a loud nearby talker
- * on the same mic can still pass.
+ * Metrics + barge-in confirmation only. Caller PCM always reaches Gemini Live
+ * (no silence replacement). This is NOT speaker identification / diarization —
+ * a loud nearby talker on the same mic can still pass.
  */
 
 const SAMPLE_RATE = 16000;
 const FRAME_MS = 20;
-/** Must exceed Gemini VAD silenceDurationMs (300) so hangover covers end-of-turn. */
+/** Must exceed Gemini VAD silenceDurationMs so hangover covers end-of-turn. */
 const HANGOVER_MS = 450;
 /** Idle path: reject short clicks / TV blips before opening. */
 const MIN_OPEN_MS_IDLE = 150;
-/** AI speaking: open sooner so "Wait!" barge-in still works. */
-const MIN_OPEN_MS_BARGE_IN = 70;
+/** AI speaking: open soon enough for "Wait!" but filter clicks (was 70). */
+const MIN_OPEN_MS_BARGE_IN = 120;
 /** After close, ignore brief re-energy for this long (idle only). */
 const REOPEN_DEBOUNCE_MS = 120;
 /** Legacy alias used by older callers/tests. */
@@ -35,6 +34,8 @@ function createSpeechGateState() {
     droppedFrames: 0,
     lastReason: 'init',
     rejectedSpeechMs: 0,
+    /** Wall clock when gate last accepted while AI was speaking. */
+    lastBargeAcceptAt: 0,
   };
 }
 
@@ -68,7 +69,7 @@ function zeroCrossingRate(pcm16) {
  * Evaluate one PCM frame.
  * @param {Buffer} pcm16k
  * @param {ReturnType<typeof createSpeechGateState>} state
- * @param {{ aiSpeaking?: boolean }} [opts]
+ * @param {{ aiSpeaking?: boolean, nowMs?: number }} [opts]
  * @returns {{ accept: boolean, reason: string, speechMs: number, open: boolean }}
  */
 function evaluateFrame(pcm16k, state, opts = {}) {
@@ -83,6 +84,10 @@ function evaluateFrame(pcm16k, state, opts = {}) {
 
   const aiSpeaking = Boolean(opts.aiSpeaking);
   const minOpenMs = aiSpeaking ? MIN_OPEN_MS_BARGE_IN : MIN_OPEN_MS_IDLE;
+  const now =
+    typeof opts.nowMs === 'number' && Number.isFinite(opts.nowMs)
+      ? opts.nowMs
+      : Date.now();
 
   const rms = frameRms(pcm16k);
   const zcr = zeroCrossingRate(pcm16k);
@@ -127,6 +132,9 @@ function evaluateFrame(pcm16k, state, opts = {}) {
     state.hangoverMs = HANGOVER_MS;
     state.closedMs = 0;
     state.lastReason = aiSpeaking ? 'interruption_accepted' : 'caller_speech_accepted';
+    if (aiSpeaking) {
+      state.lastBargeAcceptAt = now;
+    }
   } else if (!state.open && candidate && state.speechMs < minOpenMs) {
     state.lastReason = 'below_min_duration';
     state.rejectedSpeechMs = (state.rejectedSpeechMs || 0) + frameMs;
@@ -141,6 +149,9 @@ function evaluateFrame(pcm16k, state, opts = {}) {
     if (candidate) {
       state.hangoverMs = HANGOVER_MS;
       state.lastReason = aiSpeaking ? 'interruption_accepted' : 'caller_speech_accepted';
+      if (aiSpeaking) {
+        state.lastBargeAcceptAt = now;
+      }
     } else {
       state.hangoverMs -= frameMs;
       if (state.hangoverMs <= 0) {
@@ -174,10 +185,39 @@ function evaluateFrame(pcm16k, state, opts = {}) {
 }
 
 /**
+ * True when the gate has recently accepted sustained speech during AI playback.
+ * Used to confirm Twilio clear on Gemini interrupt — does not mute PCM.
+ * @param {ReturnType<typeof createSpeechGateState>} state
+ * @param {{ nowMs?: number, confirmWindowMs?: number }} [opts]
+ */
+function isBargeInConfirmed(state, opts = {}) {
+  if (!state) {
+    return false;
+  }
+  const now =
+    typeof opts.nowMs === 'number' && Number.isFinite(opts.nowMs)
+      ? opts.nowMs
+      : Date.now();
+  const windowMs = Math.max(
+    MIN_OPEN_MS_BARGE_IN,
+    Number(opts.confirmWindowMs) || MIN_OPEN_MS_BARGE_IN * 4
+  );
+  const last = Number(state.lastBargeAcceptAt) || 0;
+  if (last > 0 && now - last <= windowMs) {
+    return true;
+  }
+  // Gate currently open with enough sustained speech counts as confirmed.
+  if (state.open && state.speechMs >= MIN_OPEN_MS_BARGE_IN) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Boolean wrapper for older callers / tests.
  * @param {Buffer} pcm16k
  * @param {ReturnType<typeof createSpeechGateState>} state
- * @param {{ aiSpeaking?: boolean }} [opts]
+ * @param {{ aiSpeaking?: boolean, nowMs?: number }} [opts]
  * @returns {boolean}
  */
 function shouldForward(pcm16k, state, opts = {}) {
@@ -195,6 +235,7 @@ module.exports = {
   createSpeechGateState,
   evaluateFrame,
   shouldForward,
+  isBargeInConfirmed,
   frameRms,
   zeroCrossingRate,
 };
