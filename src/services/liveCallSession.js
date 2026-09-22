@@ -19,7 +19,7 @@ const {
 } = require('../utils/audioCodec');
 const {
   createSpeechGateState,
-  shouldForward,
+  evaluateFrame,
 } = require('../utils/speechGate');
 const { buildGreetingInstruction } = require('../config/prompts');
 const logger = require('../utils/logger');
@@ -28,6 +28,49 @@ const logger = require('../utils/logger');
 const sessions = new Map();
 
 const LATENCY_LOG_PATH = path.join(__dirname, '../../logs/latency-latest.log');
+/** Rate-limit AUDIO_GATE logs per call (ms). */
+const AUDIO_GATE_LOG_COOLDOWN_MS = 800;
+
+/**
+ * True when transcript is too tiny/garbage to treat as a caller utterance.
+ * Keeps real short commands like "Wait!" / "Ok".
+ * @param {string} text
+ */
+function isNoiseTranscript(text) {
+  const raw = String(text || '').trim();
+  if (!raw) {
+    return true;
+  }
+  const alnum = raw.replace(/[^a-zA-Z0-9]/g, '');
+  if (alnum.length < 2) {
+    return true;
+  }
+  // Pure punctuation / filler noise from STT on background audio.
+  if (/^[\s.!?…,;:\-_"'`~]+$/.test(raw)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Rate-limited AUDIO_GATE log lines.
+ * @param {object} session
+ * @param {string} message
+ */
+function logAudioGate(session, message) {
+  if (!session) {
+    return;
+  }
+  const now = nowMs();
+  const last = session.audioGateLogAt || 0;
+  const lastMsg = session.audioGateLogMsg || '';
+  if (message === lastMsg && now - last < AUDIO_GATE_LOG_COOLDOWN_MS) {
+    return;
+  }
+  session.audioGateLogAt = now;
+  session.audioGateLogMsg = message;
+  logger.info('AUDIO_GATE', `${message} callSid=${session.callSid}`);
+}
 
 /** Max Gemini reconnect attempts per failure streak (resets on success). */
 const LIVE_RECONNECT_MAX_ATTEMPTS = 5;
@@ -294,8 +337,11 @@ function createEmptySession(callSid, twilioWs, streamSid, from, to) {
     inboundMediaCount: 0,
     gatedDropCount: 0,
     speechLabeledCount: 0,
+    silenceReplacedCount: 0,
     geminiInCount: 0,
     gateWarnLogged: false,
+    audioGateLogAt: 0,
+    audioGateLogMsg: '',
     from: from || null,
     to: to || null,
     greeted: false,
@@ -790,6 +836,13 @@ async function flushInputTranscript(session) {
   if (!input) {
     return;
   }
+  if (isNoiseTranscript(input)) {
+    logAudioGate(
+      session,
+      `background/noise rejected reason=noise_transcript text="${debugTranscriptSnippet(input, 40)}"`
+    );
+    return;
+  }
   session.debugTurnSeq = (session.debugTurnSeq || 0) + 1;
   // Side-channel only: Live replies from caller AUDIO, not this text.
   logger.info(
@@ -1260,15 +1313,45 @@ function forwardTwilioMedia(session, payloadBase64) {
     if (!session.speechGate) {
       session.speechGate = createSpeechGateState();
     }
-    // Gate labels speech for metrics only — always stream PCM (incl. silence)
-    // so Gemini Live VAD can complete user turns.
-    const speechLike = shouldForward(pcm16k, session.speechGate);
-    if (!speechLike) {
-      session.gatedDropCount = (session.gatedDropCount || 0) + 1;
-    } else {
+
+    // Gate labels speech for metrics/logging only — always stream real PCM
+    // (incl. quiet frames) so Gemini Live VAD can complete user turns.
+    const decision = evaluateFrame(pcm16k, session.speechGate, {
+      aiSpeaking: Boolean(session.aiSpeaking),
+    });
+    if (decision.accept) {
       session.speechLabeledCount = (session.speechLabeledCount || 0) + 1;
-      const t = nowMs();
-      stampCallerSpeechForLatency(session, t);
+      stampCallerSpeechForLatency(session, nowMs());
+      if (session.aiSpeaking) {
+        logAudioGate(
+          session,
+          `interruption accepted reason=${decision.reason}`
+        );
+      } else if (decision.reason === 'caller_speech_accepted') {
+        logAudioGate(
+          session,
+          `caller speech accepted reason=${decision.reason}`
+        );
+        logAudioGate(session, 'speech detected');
+      } else if (decision.reason === 'hangover') {
+        // stay quiet — hangover spam
+      } else {
+        logAudioGate(session, `speech detected reason=${decision.reason}`);
+      }
+    } else {
+      session.gatedDropCount = (session.gatedDropCount || 0) + 1;
+      if (
+        decision.reason === 'below_min_duration' ||
+        decision.reason === 'non_speech_energy' ||
+        decision.reason === 'reopen_debounce'
+      ) {
+        const rejectedMs =
+          (session.speechGate && session.speechGate.rejectedSpeechMs) || 0;
+        logAudioGate(
+          session,
+          `background/noise labeled reason=${decision.reason} rejected_duration_ms=${rejectedMs}`
+        );
+      }
     }
 
     session.lastGeminiInAt = nowMs();

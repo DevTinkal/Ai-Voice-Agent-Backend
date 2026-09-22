@@ -45,13 +45,8 @@ const env = {
   knowledgeMinScore: Number(process.env.KNOWLEDGE_MIN_SCORE) || 0,
   knowledgeTopK: Number(process.env.KNOWLEDGE_TOP_K) || 3,
   knowledgeMaxChars: Number(process.env.KNOWLEDGE_MAX_CHARS) || 3000,
-  /**
-   * Absolute or backend-relative path to the single knowledge source file.
-   * Default: backend/knowledge/company.txt
-   */
-  knowledgeSourcePath: process.env.KNOWLEDGE_SOURCE_PATH || '',
   voiceLanguage: process.env.VOICE_LANGUAGE || 'en-US',
-  chatbotName: process.env.CHATBOT_NAME || 'Parker',
+  chatbotName: process.env.CHATBOT_NAME || '',
   dashboardWsUrl: process.env.DASHBOARD_WS_URL || '',
   skipTwilioSignature:
     String(process.env.SKIP_TWILIO_SIGNATURE || '').toLowerCase() === 'true',

@@ -18,6 +18,7 @@ const {
   EndSensitivity,
 } = require('@google/genai');
 const liveCallSession = require('../src/services/liveCallSession');
+const { mulaw8kToPcm16k } = require('../src/utils/audioCodec');
 
 function makeNoiseBurstPcm16k(samples = 320) {
   const buf = Buffer.alloc(samples * 2);
@@ -90,12 +91,12 @@ describe('speechGate', () => {
   });
 });
 
-describe('forwardTwilioMedia always streams PCM', () => {
-  it('sends silence frames to Gemini even when gate labels non-speech', () => {
+describe('forwardTwilioMedia always forwards real PCM', () => {
+  it('sends decoded PCM even when gate labels non-speech (metrics-only gate)', () => {
     const sent = [];
     const original = geminiLiveService.sendPcm16kAudio;
     geminiLiveService.sendPcm16kAudio = (_live, pcm) => {
-      sent.push(pcm);
+      sent.push(Buffer.from(pcm));
     };
 
     try {
@@ -104,6 +105,7 @@ describe('forwardTwilioMedia always streams PCM', () => {
         liveSession: { mock: true },
         forwardAudio: true,
         waiting: false,
+        aiSpeaking: false,
         inboundMediaCount: 0,
         gatedDropCount: 0,
         speechLabeledCount: 0,
@@ -111,8 +113,9 @@ describe('forwardTwilioMedia always streams PCM', () => {
         speechGate: createSpeechGateState(),
       };
 
-      // μ-law silence frame (20ms @ 8k) — gate will label non-speech.
+      // μ-law silence frame (20ms @ 8k) — gate will label as non-speech.
       const silenceMulawB64 = Buffer.alloc(160, 0xff).toString('base64');
+      const expectedPcm = mulaw8kToPcm16k(Buffer.from(silenceMulawB64, 'base64'));
       for (let i = 0; i < 5; i += 1) {
         liveCallSession.forwardTwilioMedia(session, silenceMulawB64);
       }
@@ -121,6 +124,11 @@ describe('forwardTwilioMedia always streams PCM', () => {
       assert.equal(session.geminiInCount, 5);
       assert.equal(session.inboundMediaCount, 5);
       assert.ok(session.gatedDropCount >= 1);
+      // Must forward real PCM — not silence-replaced zeros.
+      for (const pcm of sent) {
+        assert.equal(pcm.length, expectedPcm.length);
+        assert.ok(pcm.equals(expectedPcm));
+      }
     } finally {
       geminiLiveService.sendPcm16kAudio = original;
     }

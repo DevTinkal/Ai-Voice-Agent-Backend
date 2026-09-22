@@ -1,21 +1,9 @@
-# Single knowledge source (filesystem)
+# Knowledge corpus (runtime)
 
-Place your large company knowledge dump here:
+**Do not** put company knowledge in files here.
 
-```text
-backend/knowledge/company.txt
-```
+The only runtime source is the **Agent Prompt** saved in the Admin dashboard
+(MongoDB → chunked/embedded on Save → RAM search).
 
-Or set:
-
-```text
-KNOWLEDGE_SOURCE_PATH=/absolute/or/relative/path/to/file.txt
-```
-
-On server start the backend:
-
-1. Hashes the file (SHA-256)
-2. Re-indexes into Mongo chunks **only if the hash changed**
-3. Gemini Live retrieves relevant snippets via `searchKnowledge` — the full file is never put in `systemInstruction`
-
-`company.txt` is gitignored when large. Keep this README and `.gitkeep`.
+`company.txt` / filesystem bootstrap was removed. This folder is kept empty
+(`.gitkeep`) so old paths do not confuse deploys.

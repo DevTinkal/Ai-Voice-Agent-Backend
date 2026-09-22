@@ -2,11 +2,9 @@
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('fs');
+const path = require('path');
 const { isWaitHold, isResume } = require('../src/utils/waitIntent');
-const {
-  matchQuickFact,
-  isProjectInquiry,
-} = require('../src/services/companyQuickFacts');
 
 describe('waitIntent', () => {
   it('detects simple wait', () => {
@@ -32,28 +30,29 @@ describe('waitIntent', () => {
   });
 });
 
-describe('companyQuickFacts', () => {
-  it('matches CEO / CTO / Jaipur / what we do', () => {
-    const ceo = matchQuickFact('Who is the CEO?');
-    assert.equal(ceo.id, 'ceo');
-    assert.match(ceo.answer, /Rahul Sukhwal/);
-    assert.match(ceo.answer, /18 years/);
-    const cto = matchQuickFact('Who is the CTO of JPLoft?');
-    assert.equal(cto.id, 'cto');
-    assert.match(cto.answer, /Yashwant Sharma/);
-    assert.match(cto.answer, /14 years/);
-    assert.equal(matchQuickFact('Where is your Jaipur office?').id, 'jaipur');
-    assert.equal(matchQuickFact('What does JPLoft do?').id, 'whatWeDo');
-    assert.equal(matchQuickFact('Where is JPLoft headquartered?').id, 'hq');
-  });
-
-  it('does not match project inquiries', () => {
+describe('no hardcoded company prompt modules', () => {
+  it('agent.config and companyQuickFacts are removed', () => {
     assert.equal(
-      matchQuickFact(
-        'I need an AI healthcare platform and want to know whether JPLoft can build it'
+      fs.existsSync(
+        path.join(__dirname, '../src/agent/agent.config.js')
       ),
-      null
+      false
     );
-    assert.equal(isProjectInquiry('I need an AI healthcare platform'), true);
+    assert.equal(
+      fs.existsSync(
+        path.join(__dirname, '../src/services/companyQuickFacts.js')
+      ),
+      false
+    );
+    assert.equal(
+      fs.existsSync(path.join(__dirname, '../src/prompts')),
+      false
+    );
+    assert.equal(
+      fs.existsSync(
+        path.join(__dirname, '../src/services/knowledgeBootstrap.js')
+      ),
+      false
+    );
   });
 });

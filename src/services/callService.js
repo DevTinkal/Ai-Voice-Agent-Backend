@@ -185,24 +185,29 @@ async function getCallBySid(callSid) {
   }
 }
 
-async function getRecentCalls(limit = 20) {
+async function getRecentCalls(limit = 20, skip = 0) {
   if (!isDatabaseConnected()) {
-    return [];
+    return { calls: [], hasMore: false };
   }
 
   const safeLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
+  const safeSkip = Math.max(Number(skip) || 0, 0);
 
   try {
     await closeStaleActiveCalls();
-    return await Call.find({
-      callSid: { $regex: TWILIO_CALL_SID_RE },
-    })
+    const filter = { callSid: { $regex: TWILIO_CALL_SID_RE } };
+    // Fetch one extra to detect if more pages exist.
+    const rows = await Call.find(filter)
       .sort({ createdAt: -1 })
-      .limit(safeLimit)
+      .skip(safeSkip)
+      .limit(safeLimit + 1)
       .lean();
+    const hasMore = rows.length > safeLimit;
+    const calls = hasMore ? rows.slice(0, safeLimit) : rows;
+    return { calls, hasMore };
   } catch (error) {
     logger.error('CALL', `Failed to list calls: ${error.message}`);
-    return [];
+    return { calls: [], hasMore: false };
   }
 }
 

@@ -412,6 +412,23 @@ async function deleteDocument(documentId) {
   return true;
 }
 
+/**
+ * Drop all knowledge docs/chunks + RAM index (used when Agent prompt is cleared).
+ * Does not touch Call / Agent collections.
+ */
+async function clearAllKnowledge() {
+  if (!isDatabaseConnected()) {
+    knowledgeMemoryIndex.invalidate();
+    return { cleared: false };
+  }
+  knowledgeMemoryIndex.invalidate();
+  await KnowledgeChunk.deleteMany({});
+  await KnowledgeDocument.deleteMany({});
+  knowledgeMemoryIndex.invalidate();
+  logger.info('KNOWLEDGE', 'KNOWLEDGE_CLEARED all documents and chunks removed');
+  return { cleared: true };
+}
+
 async function listDocuments() {
   if (!isDatabaseConnected()) {
     throw new KnowledgeError(
@@ -652,6 +669,7 @@ module.exports = {
   resumeInterruptedIndexing,
   INDEX_TIMEOUT_MS,
   deleteDocument,
+  clearAllKnowledge,
   listDocuments,
   getDocument,
   getStatus,

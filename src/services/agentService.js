@@ -360,6 +360,25 @@ async function deletePrompt(promptId) {
   }
   prompt.deleteOne();
   await agent.save();
+  const remaining = combinePrompts(agent);
+  if (remaining) {
+    // Full replace index with whatever remains (no merge of deleted text).
+    scheduleAgentPromptIndex(remaining);
+  } else {
+    try {
+      knowledgeMemoryIndex.invalidate();
+    } catch (_) {
+      /* ignore */
+    }
+    setImmediate(() => {
+      knowledgeService.clearAllKnowledge().catch((error) => {
+        logger.error(
+          'KNOWLEDGE',
+          `Clear knowledge after prompt delete failed: ${error.message}`
+        );
+      });
+    });
+  }
   return agent;
 }
 

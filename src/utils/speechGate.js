@@ -1,17 +1,27 @@
 'use strict';
 
 /**
- * Lightweight speech / noise labeler for phone PCM16 @ 16 kHz.
+ * Speech / noise gate for phone PCM16 @ 16 kHz.
  * Adaptive noise floor + RMS margin + speech-like zero-crossing rate.
- * Labels speech for diagnostics — Live always receives continuous PCM
- * (including silence) so Gemini VAD can end turns. Not speaker ID.
+ *
+ * Used to decide whether real PCM reaches Gemini Live, or silence of the
+ * same length is sent instead (keeps stream continuous for Live VAD).
+ * This is NOT speaker identification / diarization — a loud nearby talker
+ * on the same mic can still pass.
  */
 
 const SAMPLE_RATE = 16000;
 const FRAME_MS = 20;
-/** Must exceed Gemini VAD silenceDurationMs (300) so labels stay open through end-of-turn. */
+/** Must exceed Gemini VAD silenceDurationMs (300) so hangover covers end-of-turn. */
 const HANGOVER_MS = 450;
-const OPEN_THRESHOLD_MS = 50;
+/** Idle path: reject short clicks / TV blips before opening. */
+const MIN_OPEN_MS_IDLE = 150;
+/** AI speaking: open sooner so "Wait!" barge-in still works. */
+const MIN_OPEN_MS_BARGE_IN = 70;
+/** After close, ignore brief re-energy for this long (idle only). */
+const REOPEN_DEBOUNCE_MS = 120;
+/** Legacy alias used by older callers/tests. */
+const OPEN_THRESHOLD_MS = MIN_OPEN_MS_IDLE;
 
 function createSpeechGateState() {
   return {
@@ -19,8 +29,12 @@ function createSpeechGateState() {
     open: false,
     speechMs: 0,
     hangoverMs: 0,
+    /** ms since last close; used for reopen debounce */
+    closedMs: REOPEN_DEBOUNCE_MS,
     forwardedFrames: 0,
     droppedFrames: 0,
+    lastReason: 'init',
+    rejectedSpeechMs: 0,
   };
 }
 
@@ -51,18 +65,24 @@ function zeroCrossingRate(pcm16) {
 }
 
 /**
- * Label whether this frame looks like speech (for metrics only).
- * Session layer always sends PCM to Gemini regardless of return value.
- *
+ * Evaluate one PCM frame.
  * @param {Buffer} pcm16k
  * @param {ReturnType<typeof createSpeechGateState>} state
- * @param {{ nowMs?: number }} [opts]
- * @returns {boolean} true when gate considers the frame speech / hangover
+ * @param {{ aiSpeaking?: boolean }} [opts]
+ * @returns {{ accept: boolean, reason: string, speechMs: number, open: boolean }}
  */
-function shouldForward(pcm16k, state, opts = {}) {
+function evaluateFrame(pcm16k, state, opts = {}) {
   if (!state || !pcm16k || !pcm16k.length) {
-    return false;
+    return {
+      accept: false,
+      reason: 'invalid_frame',
+      speechMs: 0,
+      open: false,
+    };
   }
+
+  const aiSpeaking = Boolean(opts.aiSpeaking);
+  const minOpenMs = aiSpeaking ? MIN_OPEN_MS_BARGE_IN : MIN_OPEN_MS_IDLE;
 
   const rms = frameRms(pcm16k);
   const zcr = zeroCrossingRate(pcm16k);
@@ -78,51 +98,102 @@ function shouldForward(pcm16k, state, opts = {}) {
   } else if (rms < state.noiseFloor * 0.8) {
     state.noiseFloor = state.noiseFloor * 0.98 + rms * 0.02;
   }
-  // Keep floor in a sane telephony band.
   state.noiseFloor = Math.min(2000, Math.max(60, state.noiseFloor));
 
-  // Softer margin so quiet phone "hi" still labels as speech.
   const threshold = state.noiseFloor + Math.max(100, state.noiseFloor * 0.4);
-  // Speech typically has moderate ZCR; pure tones / clicks differ.
+  // Speech typically has moderate ZCR; pure tones / clicks / hiss differ.
   const speechLike = zcr >= 0.015 && zcr <= 0.4;
   const energetic = rms >= threshold;
+  const candidate = energetic && speechLike;
 
-  if (energetic && speechLike) {
+  if (!state.open) {
+    state.closedMs = (state.closedMs || 0) + frameMs;
+  }
+
+  if (candidate) {
     state.speechMs += frameMs;
   } else {
     state.speechMs = Math.max(0, state.speechMs - frameMs * 0.5);
+    if (energetic && !speechLike) {
+      state.lastReason = 'non_speech_energy';
+      state.rejectedSpeechMs = (state.rejectedSpeechMs || 0) + frameMs;
+    }
   }
 
-  if (!state.open && state.speechMs >= OPEN_THRESHOLD_MS) {
+  const debounceOk = aiSpeaking || state.closedMs >= REOPEN_DEBOUNCE_MS;
+
+  if (!state.open && candidate && state.speechMs >= minOpenMs && debounceOk) {
     state.open = true;
     state.hangoverMs = HANGOVER_MS;
+    state.closedMs = 0;
+    state.lastReason = aiSpeaking ? 'interruption_accepted' : 'caller_speech_accepted';
+  } else if (!state.open && candidate && state.speechMs < minOpenMs) {
+    state.lastReason = 'below_min_duration';
+    state.rejectedSpeechMs = (state.rejectedSpeechMs || 0) + frameMs;
+  } else if (!state.open && !candidate && !energetic) {
+    state.lastReason = 'quiet';
+  } else if (!state.open && !debounceOk && candidate) {
+    state.lastReason = 'reopen_debounce';
+    state.rejectedSpeechMs = (state.rejectedSpeechMs || 0) + frameMs;
   }
 
   if (state.open) {
-    if (energetic && speechLike) {
+    if (candidate) {
       state.hangoverMs = HANGOVER_MS;
+      state.lastReason = aiSpeaking ? 'interruption_accepted' : 'caller_speech_accepted';
     } else {
       state.hangoverMs -= frameMs;
       if (state.hangoverMs <= 0) {
         state.open = false;
         state.speechMs = 0;
+        state.closedMs = 0;
+        state.lastReason = 'hangover_ended';
+      } else {
+        state.lastReason = 'hangover';
       }
     }
   }
 
   if (state.open) {
     state.forwardedFrames += 1;
-    return true;
+    return {
+      accept: true,
+      reason: state.lastReason,
+      speechMs: state.speechMs,
+      open: true,
+    };
   }
+
   state.droppedFrames += 1;
-  return false;
+  return {
+    accept: false,
+    reason: state.lastReason || 'background_noise',
+    speechMs: state.speechMs,
+    open: false,
+  };
+}
+
+/**
+ * Boolean wrapper for older callers / tests.
+ * @param {Buffer} pcm16k
+ * @param {ReturnType<typeof createSpeechGateState>} state
+ * @param {{ aiSpeaking?: boolean }} [opts]
+ * @returns {boolean}
+ */
+function shouldForward(pcm16k, state, opts = {}) {
+  return evaluateFrame(pcm16k, state, opts).accept;
 }
 
 module.exports = {
   SAMPLE_RATE,
+  FRAME_MS,
   HANGOVER_MS,
   OPEN_THRESHOLD_MS,
+  MIN_OPEN_MS_IDLE,
+  MIN_OPEN_MS_BARGE_IN,
+  REOPEN_DEBOUNCE_MS,
   createSpeechGateState,
+  evaluateFrame,
   shouldForward,
   frameRms,
   zeroCrossingRate,

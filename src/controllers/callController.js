@@ -12,8 +12,9 @@ const logger = require('../utils/logger');
 async function listCalls(req, res) {
   try {
     const limit = req.query.limit;
-    const calls = await callService.getRecentCalls(limit);
-    return res.json({ calls });
+    const skip = req.query.skip;
+    const { calls, hasMore } = await callService.getRecentCalls(limit, skip);
+    return res.json({ calls, hasMore: Boolean(hasMore) });
   } catch (error) {
     logger.error('API', `listCalls failed: ${error.message}`);
     return res.status(500).json({ error: 'Failed to retrieve calls' });

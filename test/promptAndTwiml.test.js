@@ -46,7 +46,7 @@ describe('phone prompt and env wiring', () => {
 
   it('exposes Live env fields', () => {
     const { env } = require('../src/config/env');
-    assert.ok(env.chatbotName);
+    assert.equal(typeof env.chatbotName, 'string');
     assert.ok(env.geminiLiveModel);
     assert.ok(env.geminiLiveVoice);
     assert.ok(env.voiceLanguage);
@@ -66,29 +66,19 @@ describe('phone prompt and env wiring', () => {
     assert.doesNotMatch(xml, /ConversationRelay/i);
   });
 
-  it('retired txt dumps are archived and not the runtime source', () => {
-    const archivePhone = path.join(
-      __dirname,
-      '../src/prompts/archive/jploft-sales-executive-phone.txt.corrupted-dump.bak'
-    );
-    const archiveChatbot = path.join(
-      __dirname,
-      '../src/prompts/archive/jploft-sales-executive.txt.bak'
-    );
-    const liveTxt = path.join(
-      __dirname,
-      '../src/prompts/jploft-sales-executive-phone.txt'
-    );
-    assert.ok(fs.existsSync(archivePhone));
-    assert.ok(fs.existsSync(archiveChatbot));
-    assert.equal(fs.existsSync(liveTxt), false);
+  it('no archived prompt dumps and no agent.config in Live prompts', () => {
+    const promptsDir = path.join(__dirname, '../src/prompts');
+    assert.equal(fs.existsSync(promptsDir), false);
 
-    // Seed-only file may still exist; Live prompts.js must not require it.
+    const agentConfig = path.join(__dirname, '../src/agent/agent.config.js');
+    assert.equal(fs.existsSync(agentConfig), false);
+
     const promptsSrc = fs.readFileSync(
       path.join(__dirname, '../src/config/prompts.js'),
       'utf8'
     );
     assert.doesNotMatch(promptsSrc, /agent\.config/);
     assert.doesNotMatch(promptsSrc, /loadJploftPrompt/);
+    assert.doesNotMatch(promptsSrc, /JPLoft/i);
   });
 });
