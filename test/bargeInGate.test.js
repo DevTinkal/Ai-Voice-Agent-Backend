@@ -18,7 +18,7 @@ const {
   EndSensitivity,
 } = require('@google/genai');
 const liveCallSession = require('../src/services/liveCallSession');
-const { mulaw8kToPcm16k } = require('../src/utils/audioCodec');
+const { mulaw8kToPcm16k, pcm16ToMulaw, resamplePcm16 } = require('../src/utils/audioCodec');
 
 function makeNoiseBurstPcm16k(samples = 320) {
   const buf = Buffer.alloc(samples * 2);
@@ -132,6 +132,112 @@ describe('forwardTwilioMedia always forwards real PCM', () => {
     } finally {
       geminiLiveService.sendPcm16kAudio = original;
     }
+  });
+
+  it('forwards real PCM while waiting=true (no mute deadlock)', () => {
+    const sent = [];
+    const original = geminiLiveService.sendPcm16kAudio;
+    geminiLiveService.sendPcm16kAudio = (_live, pcm) => {
+      sent.push(Buffer.from(pcm));
+    };
+    try {
+      const session = {
+        callSid: 'CA_WAIT_PCM',
+        liveSession: { mock: true },
+        forwardAudio: true,
+        waiting: true,
+        aiSpeaking: false,
+        inboundMediaCount: 0,
+        gatedDropCount: 0,
+        speechLabeledCount: 0,
+        geminiInCount: 0,
+        speechGate: createSpeechGateState(),
+      };
+      const silenceMulawB64 = Buffer.alloc(160, 0xff).toString('base64');
+      const expectedPcm = mulaw8kToPcm16k(Buffer.from(silenceMulawB64, 'base64'));
+      liveCallSession.forwardTwilioMedia(session, silenceMulawB64);
+      assert.equal(sent.length, 1);
+      assert.ok(sent[0].equals(expectedPcm));
+      assert.equal(session.forwardAudio, true);
+      // Quiet frame while waiting must not clear wait (speech gate did not accept).
+      assert.equal(session.waiting, true);
+    } finally {
+      geminiLiveService.sendPcm16kAudio = original;
+    }
+  });
+});
+
+describe('wait-hold recovery', () => {
+  it('wait hold keeps forwardAudio true and sets waiting', async () => {
+    const session = {
+      callSid: 'CA_WAIT_HOLD',
+      liveSession: {
+        sendRealtimeInput() {},
+      },
+      waiting: false,
+      forwardAudio: true,
+      history: [],
+      streamSid: 'MZ1',
+      twilioWs: { readyState: 1, send() {} },
+      playbackGeneration: 0,
+      outboundRemainder: Buffer.alloc(0),
+    };
+    await liveCallSession.onCallerUtterance(session, 'wait wait');
+    assert.equal(session.waiting, true);
+    assert.equal(session.forwardAudio, true);
+  });
+
+  it('speech after wait clears waiting so next utterance can proceed', () => {
+    const sent = [];
+    const original = geminiLiveService.sendPcm16kAudio;
+    geminiLiveService.sendPcm16kAudio = (_live, pcm) => {
+      sent.push(Buffer.from(pcm));
+    };
+    try {
+      const session = {
+        callSid: 'CA_WAIT_RECOVER',
+        liveSession: { mock: true },
+        forwardAudio: true,
+        waiting: true,
+        aiSpeaking: false,
+        inboundMediaCount: 0,
+        gatedDropCount: 0,
+        speechLabeledCount: 0,
+        geminiInCount: 0,
+        speechGate: createSpeechGateState(),
+      };
+      // Sustained speech-like 16k PCM → 8k μ-law for Twilio media frames.
+      const speech16k = makeSpeechLikePcm16k(3200, 4000);
+      const speech8k = resamplePcm16(speech16k, 16000, 8000);
+      const mulaw = pcm16ToMulaw(speech8k);
+      const frameBytes = 160;
+      for (let offset = 0; offset + frameBytes <= mulaw.length; offset += frameBytes) {
+        const b64 = mulaw.subarray(offset, offset + frameBytes).toString('base64');
+        liveCallSession.forwardTwilioMedia(session, b64);
+      }
+      assert.ok(sent.length > 0);
+      assert.equal(session.waiting, false);
+      assert.equal(session.forwardAudio, true);
+      assert.ok(session.speechLabeledCount >= 1);
+    } finally {
+      geminiLiveService.sendPcm16kAudio = original;
+    }
+  });
+
+  it('utterance after wait clears waiting without requiring resume phrase', async () => {
+    const session = {
+      callSid: 'CA_WAIT_UTTER',
+      liveSession: null,
+      waiting: true,
+      forwardAudio: true,
+      history: [],
+    };
+    await liveCallSession.onCallerUtterance(
+      session,
+      'Tell me about your company'
+    );
+    assert.equal(session.waiting, false);
+    assert.equal(session.forwardAudio, true);
   });
 });
 

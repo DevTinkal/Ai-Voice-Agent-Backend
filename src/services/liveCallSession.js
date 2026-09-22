@@ -438,6 +438,10 @@ function clearTwilioPlayback(session) {
       'LATENCY',
       `twilio_clear call=${session.callSid} t+${elapsedMs(session)}ms`
     );
+    logger.info(
+      'LIVE',
+      `[TWILIO_CLEAR] callSid=${session.callSid} streamSid=${session.streamSid}`
+    );
   } catch (error) {
     logger.warn('LIVE', `Failed to clear Twilio playback: ${error.message}`);
   }
@@ -482,6 +486,10 @@ function playGeminiPcmOnce(session, pcmBuffer, generationAtEnqueue) {
     session.turnFirstAudioLogged = true;
     session.turnTwilioFirstSendAt = null;
     session.twilioSendTurnSeq = null;
+    logger.info(
+      'LIVE',
+      `[AI_RESPONSE_START][AI_AUDIO_OUT] callSid=${session.callSid} gen=${session.playbackGeneration} chunk=${chunkId}`
+    );
     if (!session.latencyBreakdownLogged) {
       session.latencyBreakdownIncompleteLogged = false;
       session.turnGeminiFirstAudioAt = nowMs();
@@ -714,7 +722,10 @@ function handleLiveMessage(session, message, listenerEpoch) {
       type: 'CALL_INTERRUPT',
       data: { callSid: session.callSid },
     });
-    logger.info('LIVE', `interrupt callSid=${session.callSid}`);
+    logger.info(
+      'LIVE',
+      `[GEMINI_INTERRUPT] callSid=${session.callSid}`
+    );
     // Do not play any audio that arrived on the same interrupted message.
     return;
   }
@@ -893,8 +904,10 @@ async function onCallerUtterance(session, text) {
   callService.touchActivity(session.callSid).catch(() => {});
 
   if (isWaitHold(text)) {
+    // Pause AI playback only — never mute caller PCM to Gemini (that deadlocks
+    // recovery: no audio → no transcript → waiting never clears).
     session.waiting = true;
-    session.forwardAudio = false;
+    session.forwardAudio = true;
     clearTwilioPlayback(session);
     try {
       if (session.liveSession) {
@@ -910,13 +923,20 @@ async function onCallerUtterance(session, text) {
         reason: 'caller_hold',
       },
     });
-    logger.info('LIVE', `wait hold callSid=${session.callSid}`);
+    logger.info(
+      'LIVE',
+      `[WAIT_HOLD] callSid=${session.callSid} forwardAudio=true waiting=true`
+    );
     return;
   }
 
   if (session.waiting) {
     session.waiting = false;
     session.forwardAudio = true;
+    logger.info(
+      'LIVE',
+      `[AI_RESPONSE_RECOVERY] callSid=${session.callSid} reason=caller_utterance`
+    );
     if (isResume(text)) {
       return;
     }
@@ -1298,7 +1318,8 @@ async function startLiveCall({ twilioWs, callSid, streamSid, from, to }) {
 }
 
 function forwardTwilioMedia(session, payloadBase64) {
-  if (!session || !session.liveSession || !session.forwardAudio || session.waiting) {
+  // waiting must NOT block PCM — only forwardAudio=false (call end) stops input.
+  if (!session || !session.liveSession || !session.forwardAudio) {
     return;
   }
   if (!payloadBase64) {
@@ -1322,6 +1343,18 @@ function forwardTwilioMedia(session, payloadBase64) {
     if (decision.accept) {
       session.speechLabeledCount = (session.speechLabeledCount || 0) + 1;
       stampCallerSpeechForLatency(session, nowMs());
+      if (session.waiting) {
+        session.waiting = false;
+        session.forwardAudio = true;
+        logger.info(
+          'LIVE',
+          `[CALLER_SPEECH_AFTER_INTERRUPT] callSid=${session.callSid} reason=${decision.reason}`
+        );
+        logger.info(
+          'LIVE',
+          `[AI_RESPONSE_RECOVERY] callSid=${session.callSid} reason=speech_gate_accept`
+        );
+      }
       if (session.aiSpeaking) {
         logAudioGate(
           session,
@@ -1356,6 +1389,12 @@ function forwardTwilioMedia(session, payloadBase64) {
 
     session.lastGeminiInAt = nowMs();
     session.geminiInCount = (session.geminiInCount || 0) + 1;
+    if (session.geminiInCount === 1 || session.geminiInCount % 200 === 0) {
+      logger.info(
+        'LIVE',
+        `[AUDIO_IN][GEMINI_INPUT] callSid=${session.callSid} frames=${session.geminiInCount} waiting=${Boolean(session.waiting)}`
+      );
+    }
     geminiLiveService.sendPcm16kAudio(session.liveSession, pcm16k);
 
     // One-shot warn if almost nothing looks like speech after AI started talking.
@@ -1436,6 +1475,7 @@ module.exports = {
   playGeminiPcmOnce,
   handleLiveMessage,
   handleLiveToolCalls,
+  onCallerUtterance,
   maybeLogLatencyBreakdown,
   setNowMsForTests,
   resetOutboundReplyStamps,
