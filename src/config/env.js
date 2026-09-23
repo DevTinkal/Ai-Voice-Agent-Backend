@@ -85,6 +85,20 @@ function getOutboundVoiceWebhookUrl() {
   return `${env.publicBaseUrl.replace(/\/$/, '')}/voice/outbound`;
 }
 
+function getOutboundStatusCallbackUrl() {
+  if (!env.publicBaseUrl) {
+    return '';
+  }
+  return `${env.publicBaseUrl.replace(/\/$/, '')}/voice/outbound-status`;
+}
+
+function getOutboundGreetingPlayUrl(callSid) {
+  if (!env.publicBaseUrl || !callSid) {
+    return '';
+  }
+  return `${env.publicBaseUrl.replace(/\/$/, '')}/voice/outbound-greeting/${encodeURIComponent(callSid)}`;
+}
+
 function getMediaStreamWsUrl() {
   return env.mediaStreamWsUrl || '';
 }
@@ -93,5 +107,7 @@ module.exports = {
   env,
   getVoiceWebhookUrl,
   getOutboundVoiceWebhookUrl,
+  getOutboundStatusCallbackUrl,
+  getOutboundGreetingPlayUrl,
   getMediaStreamWsUrl,
 };

@@ -4,9 +4,14 @@ const callService = require('../services/callService');
 const conversationService = require('../services/conversationService');
 const twilioVoiceService = require('../services/twilioVoiceService');
 const agentService = require('../services/agentService');
+const liveCallSession = require('../services/liveCallSession');
 const dashboardSocket = require('../websocket/dashboardSocket');
 const { getDatabaseStatus } = require('../config/database');
-const { env, getOutboundVoiceWebhookUrl } = require('../config/env');
+const {
+  env,
+  getOutboundVoiceWebhookUrl,
+  getOutboundStatusCallbackUrl,
+} = require('../config/env');
 const logger = require('../utils/logger');
 
 async function listCalls(req, res) {
@@ -100,6 +105,7 @@ async function startOutboundCall(req, res) {
     const created = await twilioVoiceService.createOutboundCall({
       to,
       twimlUrl,
+      statusCallbackUrl: getOutboundStatusCallbackUrl() || undefined,
     });
 
     if (!callService.isValidTwilioCallSid(created.callSid)) {
@@ -131,6 +137,21 @@ async function startOutboundCall(req, res) {
       },
     });
 
+    // Dial-time BUFFER_ONLY prime: generate greeting while ringing — never play yet.
+    liveCallSession
+      .primeOutboundLive(created.callSid, {
+        from: created.from,
+        to: created.to,
+        agentId: agentResolved.agentId,
+        atDial: true,
+      })
+      .catch((error) => {
+        logger.warn(
+          'API',
+          `dial prime background: ${error.message}`
+        );
+      });
+
     return res.status(201).json({
       callSid: created.callSid,
       status: created.status,
@@ -152,6 +173,8 @@ async function startOutboundCall(req, res) {
 async function hangupOutboundCall(req, res) {
   try {
     const { callSid } = req.params;
+    // Tear down dial-prime Gemini before/without Media Stream (never play after hangup).
+    await liveCallSession.endLiveCall(callSid, 'hangup').catch(() => {});
     const result = await twilioVoiceService.hangupCall(callSid);
     await callService.markCompleted(callSid);
     dashboardSocket.broadcast({

@@ -119,6 +119,9 @@ describe('outbound call API and TwiML', () => {
     mock.method(liveCallSession, 'primeOutboundLive', async () => null);
     mock.method(liveCallSession, 'beginFirstResponseTimeline', () => {});
     mock.method(liveCallSession, 'stampFirstResponse', () => Date.now());
+    mock.method(liveCallSession, 'hasOutboundGreetingClip', () => false);
+    mock.method(liveCallSession, 'authorizeOutboundGreetingPlay', () => false);
+    mock.method(liveCallSession, 'endLiveCall', async () => null);
     mock.method(dashboardSocket, 'broadcast', (event) => {
       broadcastEvents.push(event);
     });

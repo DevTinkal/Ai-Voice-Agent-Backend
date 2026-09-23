@@ -151,6 +151,46 @@ function pcm24kToMulaw8k(pcm24kBuffer) {
  * Returns { frames, remainder } — remainder must be carried to the next chunk.
  * Frames are copied Buffers (not shared subarrays).
  */
+/**
+ * Build a mono 8 kHz 16-bit PCM WAV suitable for Twilio `<Play>`.
+ * @param {Buffer} pcm16le
+ * @param {number} [sampleRate=8000]
+ * @returns {Buffer}
+ */
+function buildPcm16Wav(pcm16le, sampleRate = 8000) {
+  const data = Buffer.isBuffer(pcm16le) ? pcm16le : Buffer.from(pcm16le || []);
+  const dataSize = data.length;
+  const out = Buffer.alloc(44 + dataSize);
+  out.write('RIFF', 0);
+  out.writeUInt32LE(36 + dataSize, 4);
+  out.write('WAVE', 8);
+  out.write('fmt ', 12);
+  out.writeUInt32LE(16, 16);
+  out.writeUInt16LE(1, 20); // PCM
+  out.writeUInt16LE(1, 22); // mono
+  out.writeUInt32LE(sampleRate, 24);
+  out.writeUInt32LE(sampleRate * 2, 28); // byte rate
+  out.writeUInt16LE(2, 32); // block align
+  out.writeUInt16LE(16, 34); // bits per sample
+  out.write('data', 36);
+  out.writeUInt32LE(dataSize, 40);
+  if (dataSize) {
+    data.copy(out, 44);
+  }
+  return out;
+}
+
+/**
+ * Convert Gemini Live 24 kHz PCM16 output into an 8 kHz PCM WAV for Twilio Play.
+ * @param {Buffer} pcm24k
+ * @returns {Buffer}
+ */
+function pcm24kToWav8k(pcm24k) {
+  const mulaw = pcm24kToMulaw8k(pcm24k);
+  const pcm8k = mulawToPcm16(mulaw);
+  return buildPcm16Wav(pcm8k, 8000);
+}
+
 function chunkMulawForTwilio(mulawBuffer, frameBytes = TWILIO_FRAME_BYTES, priorRemainder = null) {
   const parts = [];
   if (priorRemainder && priorRemainder.length) {
@@ -179,5 +219,7 @@ module.exports = {
   resamplePcm16,
   mulaw8kToPcm16k,
   pcm24kToMulaw8k,
+  buildPcm16Wav,
+  pcm24kToWav8k,
   chunkMulawForTwilio,
 };

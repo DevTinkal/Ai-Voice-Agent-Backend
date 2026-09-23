@@ -5,6 +5,7 @@ const {
   env,
   getVoiceWebhookUrl,
   getOutboundVoiceWebhookUrl,
+  getOutboundGreetingPlayUrl,
   getMediaStreamWsUrl,
 } = require('../config/env');
 const callService = require('../services/callService');
@@ -49,9 +50,12 @@ function validateTwilioRequest(req, expectedUrl) {
 }
 
 /**
- * Shared Connect + Stream TwiML used by inbound and outbound answer webhooks.
+ * Connect + Stream TwiML, optionally preceded by answer-gated greeting `<Play>`.
+ * @param {string} from
+ * @param {string} to
+ * @param {{ playUrl?: string }} [opts]
  */
-function buildMediaStreamTwiml(from, to) {
+function buildMediaStreamTwiml(from, to, opts = {}) {
   const mediaUrl = getMediaStreamWsUrl();
   const VoiceResponse = twilio.twiml.VoiceResponse;
   const response = new VoiceResponse();
@@ -63,13 +67,18 @@ function buildMediaStreamTwiml(from, to) {
     return { xml: response.toString(), ok: false };
   }
 
+  const playUrl = opts.playUrl ? String(opts.playUrl).trim() : '';
+  if (playUrl) {
+    response.play(playUrl);
+  }
+
   const connect = response.connect();
   const stream = connect.stream({
     url: mediaUrl,
   });
   stream.parameter({ name: 'from', value: from || '' });
   stream.parameter({ name: 'to', value: to || '' });
-  return { xml: response.toString(), ok: true };
+  return { xml: response.toString(), ok: true, playUrl: playUrl || null };
 }
 
 function buildAgentUnavailableTwiml() {
@@ -173,9 +182,8 @@ async function handleIncomingCall(req, res) {
 }
 
 /**
- * TwiML webhook for outbound calls after the callee answers.
- * Returns Connect+Stream immediately, then primes Gemini greeting in parallel
- * with Media Stream setup so the callee hears the agent ASAP.
+ * TwiML webhook for outbound calls AFTER the callee answers.
+ * Playback gate: only here may the buffered greeting become audible.
  */
 async function handleOutboundTwiml(req, res) {
   try {
@@ -218,7 +226,28 @@ async function handleOutboundTwiml(req, res) {
       agentId = agentGate.agentId;
     }
 
-    const built = buildMediaStreamTwiml(from, to);
+    let playUrl = null;
+    // If Gemini finished (or nearly finished) buffering during ring, assemble clip now.
+    const primedSession = liveCallSession.getSession(callSid);
+    if (primedSession) {
+      liveCallSession.maybeFinalizeOutboundGreetingClip(primedSession);
+    }
+    if (liveCallSession.hasOutboundGreetingClip(callSid)) {
+      const authorized = liveCallSession.authorizeOutboundGreetingPlay(callSid);
+      if (authorized) {
+        playUrl = getOutboundGreetingPlayUrl(callSid);
+        liveCallSession.stampFirstResponse(callSid, 'greeting_play_twiml');
+      }
+    }
+
+    if (!playUrl) {
+      logger.info(
+        'OUTBOUND_GREETING',
+        `[OUTBOUND_GREETING] state=ANSWERED action=FALLBACK callSid=${callSid}`
+      );
+    }
+
+    const built = buildMediaStreamTwiml(from, to, { playUrl });
     if (!built.ok) {
       logger.error('TWILIO', 'MEDIA_STREAM_WS_URL is not configured');
       res.type('text/xml');
@@ -229,7 +258,7 @@ async function handleOutboundTwiml(req, res) {
     res.type('text/xml');
     res.status(200).send(built.xml);
 
-    // Background: DB upsert + dashboard + Gemini prime (do not delay TwiML).
+    // Background: DB upsert + dashboard + answer-time prime FALLBACK (no-op if dial primed).
     callService
       .createCall({
         callSid,
@@ -258,7 +287,7 @@ async function handleOutboundTwiml(req, res) {
     });
 
     liveCallSession
-      .primeOutboundLive(callSid, { from, to, agentId })
+      .primeOutboundLive(callSid, { from, to, agentId, atDial: false })
       .catch((error) => {
         logger.warn(
           'TWILIO',
@@ -279,9 +308,69 @@ async function handleOutboundTwiml(req, res) {
   }
 }
 
+/**
+ * Serve answer-gated greeting WAV for Twilio `<Play>` (never during RINGING).
+ */
+function handleOutboundGreetingClip(req, res) {
+  const callSid = req.params.callSid;
+  if (!callService.isValidTwilioCallSid(callSid)) {
+    return res.status(404).end();
+  }
+  const clip = liveCallSession.consumeOutboundGreetingClip(callSid);
+  if (!clip) {
+    logger.warn(
+      'OUTBOUND_GREETING',
+      `[OUTBOUND_GREETING] state=ANSWERED action=CLIP_MISSING callSid=${callSid}`
+    );
+    return res.status(404).end();
+  }
+  res.set({
+    'Content-Type': 'audio/wav',
+    'Content-Length': clip.length,
+    'Cache-Control': 'no-store',
+  });
+  return res.status(200).send(clip);
+}
+
+/**
+ * Twilio status callback — teardown dial prime if call never reached Media Stream.
+ */
+async function handleOutboundStatus(req, res) {
+  try {
+    const callSid = req.body.CallSid;
+    const callStatus = String(req.body.CallStatus || '').toLowerCase();
+    res.status(204).end();
+
+    if (!callService.isValidTwilioCallSid(callSid)) {
+      return;
+    }
+
+    if (
+      callStatus === 'completed' ||
+      callStatus === 'busy' ||
+      callStatus === 'no-answer' ||
+      callStatus === 'canceled' ||
+      callStatus === 'failed'
+    ) {
+      const session = liveCallSession.getSession(callSid);
+      if (session && !session.streamSid && !session.twilioWs) {
+        logger.info(
+          'OUTBOUND_GREETING',
+          `[OUTBOUND_GREETING] state=RINGING action=TEARDOWN callSid=${callSid} status=${callStatus}`
+        );
+        await liveCallSession.endLiveCall(callSid, 'no_answer').catch(() => {});
+      }
+    }
+  } catch (error) {
+    logger.warn('TWILIO', `outbound status callback: ${error.message}`);
+  }
+}
+
 module.exports = {
   handleIncomingCall,
   handleOutboundTwiml,
+  handleOutboundGreetingClip,
+  handleOutboundStatus,
   validateTwilioRequest,
   buildMediaStreamTwiml,
 };

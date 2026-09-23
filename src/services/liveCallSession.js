@@ -20,6 +20,7 @@ const {
 const {
   mulaw8kToPcm16k,
   pcm24kToMulaw8k,
+  pcm24kToWav8k,
   chunkMulawForTwilio,
   TWILIO_FRAME_BYTES,
 } = require('../utils/audioCodec');
@@ -462,8 +463,17 @@ function createEmptySession(callSid, twilioWs, streamSid, from, to) {
      * @type {Array<{ pcm: Buffer, generation: number }>}
      */
     pendingOutboundPcm: [],
-    /** In-flight outbound Gemini prime promise (answer → Media Stream overlap). */
+    /** In-flight outbound Gemini prime promise (dial or answer → Media Stream overlap). */
     primePromise: null,
+    /** Dial-time buffer-only prime (no phone audio until answer). */
+    primedAtDial: false,
+    /** Assembled 8 kHz PCM WAV of greeting for answer-gated TwiML `<Play>`. */
+    greetingClip: null,
+    greetingClipReady: false,
+    /** Answer TwiML authorized one-shot Play of greetingClip. */
+    greetingPlayAuthorized: false,
+    /** Greeting already delivered via TwiML Play — do not flush/replay on Media Stream. */
+    greetingPlayedViaTwiml: false,
     gateWarnLogged: false,
     audioGateLogAt: 0,
     audioGateLogMsg: '',
@@ -657,7 +667,8 @@ function playGeminiPcmOnce(session, pcmBuffer, generationAtEnqueue) {
     Boolean(session.twilioWs) &&
     session.twilioWs.readyState === 1;
 
-  // Outbound prime: Media Stream not attached yet — queue PCM for flush.
+  // Outbound prime: Media Stream not attached yet — queue PCM for flush / clip.
+  // CRITICAL: must never send to the phone while ringing (no twilioWs yet).
   if (!twilioReady) {
     if (!Array.isArray(session.pendingOutboundPcm)) {
       session.pendingOutboundPcm = [];
@@ -668,7 +679,10 @@ function playGeminiPcmOnce(session, pcmBuffer, generationAtEnqueue) {
     });
     if (!session.firstGeminiAudioAt) {
       session.firstGeminiAudioAt = nowMs();
-      logFirstResponse(session, 'first_gemini_audio');
+      // Do not start answer FIRST_RESPONSE clock during dial RINGING buffer.
+      if (!session.primedAtDial || session.greetingPlayAuthorized) {
+        logFirstResponse(session, 'first_gemini_audio');
+      }
     }
     return;
   }
@@ -1032,6 +1046,7 @@ function handleLiveMessage(session, message, listenerEpoch) {
     session.aiSpeaking = false;
     session.turnFirstAudioLogged = false;
     resetOutboundReplyStamps(session);
+    maybeFinalizeOutboundGreetingClip(session);
   }
 
   // --- AI transcript ---
@@ -1697,10 +1712,15 @@ async function reconnectLiveSession(session, reason) {
 
 /**
  * Flush Gemini PCM buffered during outbound prime once Twilio Media Stream is up.
+ * Skipped when greeting was already played via answer-gated TwiML `<Play>`.
  * @param {object} session
  */
 function flushPendingOutboundPcm(session) {
   if (!session || !Array.isArray(session.pendingOutboundPcm)) {
+    return;
+  }
+  if (session.greetingPlayedViaTwiml) {
+    session.pendingOutboundPcm = [];
     return;
   }
   const queued = session.pendingOutboundPcm;
@@ -1723,6 +1743,111 @@ function flushPendingOutboundPcm(session) {
         : session.playbackGeneration;
     playGeminiPcmOnce(session, item.pcm, gen);
   }
+}
+
+/**
+ * Assemble answer-gated greeting WAV from buffered Gemini PCM (RINGING prep only).
+ * Never plays to the phone.
+ * @param {object} session
+ */
+function maybeFinalizeOutboundGreetingClip(session) {
+  if (!session || session.greetingClipReady || session.greetingPlayedViaTwiml) {
+    return;
+  }
+  if (!Array.isArray(session.pendingOutboundPcm) || !session.pendingOutboundPcm.length) {
+    return;
+  }
+  // Only while Media Stream is not yet attached (buffer-only phase).
+  const twilioReady =
+    Boolean(session.streamSid) &&
+    Boolean(session.twilioWs) &&
+    session.twilioWs.readyState === 1;
+  if (twilioReady) {
+    return;
+  }
+
+  try {
+    const pcm = Buffer.concat(
+      session.pendingOutboundPcm
+        .filter((item) => item && item.pcm && item.pcm.length)
+        .map((item) => item.pcm)
+    );
+    if (pcm.length < 2400) {
+      return;
+    }
+    session.greetingClip = pcm24kToWav8k(pcm);
+    session.greetingClipReady = true;
+    logger.info(
+      'LIVE',
+      `greeting_clip_ready callSid=${session.callSid} wavBytes=${session.greetingClip.length} pcmBytes=${pcm.length}`
+    );
+  } catch (error) {
+    logger.warn(
+      'LIVE',
+      `greeting clip assemble failed callSid=${session.callSid}: ${error.message}`
+    );
+  }
+}
+
+/**
+ * @param {string} callSid
+ * @returns {boolean}
+ */
+function hasOutboundGreetingClip(callSid) {
+  const session = sessions.get(String(callSid || ''));
+  return Boolean(
+    session &&
+      session.greetingClipReady &&
+      session.greetingClip &&
+      session.greetingClip.length &&
+      !session.greetingPlayedViaTwiml
+  );
+}
+
+/**
+ * Authorize one-shot TwiML Play of the buffered greeting (answer gate only).
+ * Clears pending PCM so Media Stream will not replay the same audio.
+ * @param {string} callSid
+ * @returns {boolean} true if Play was authorized
+ */
+function authorizeOutboundGreetingPlay(callSid) {
+  const session = sessions.get(String(callSid || ''));
+  if (
+    !session ||
+    !session.greetingClipReady ||
+    !session.greetingClip ||
+    !session.greetingClip.length ||
+    session.greetingPlayedViaTwiml
+  ) {
+    return false;
+  }
+  session.greetingPlayAuthorized = true;
+  session.greetingPlayedViaTwiml = true;
+  session.pendingOutboundPcm = [];
+  logger.info(
+    'OUTBOUND_GREETING',
+    `[OUTBOUND_GREETING] state=ANSWERED action=PLAY_STARTED callSid=${callSid}`
+  );
+  return true;
+}
+
+/**
+ * Serve greeting WAV only after answer-gated Play authorization.
+ * Clip remains available briefly for Twilio HTTP retries until Media Stream / end.
+ * @param {string} callSid
+ * @returns {Buffer|null}
+ */
+function consumeOutboundGreetingClip(callSid) {
+  const session = sessions.get(String(callSid || ''));
+  if (
+    !session ||
+    !session.greetingPlayedViaTwiml ||
+    !session.greetingClip ||
+    !session.greetingClip.length
+  ) {
+    return null;
+  }
+  return session.greetingClip;
 }
 
 /**
@@ -1774,15 +1899,18 @@ async function loadAgentOntoSession(session, preferredAgentId) {
 }
 
 /**
- * Start Gemini + greeting as soon as outbound callee answers (before Media Stream).
- * Overlaps greeting TTS with Twilio stream setup.
+ * Prime Gemini Live for an outbound call.
+ * - atDial=true: RINGING buffer-only (connect + generate greeting; never play to phone)
+ * - atDial=false: answer-time overlap / FALLBACK when dial clip was not ready
  * @param {string} callSid
- * @param {{ from?: string, to?: string, agentId?: * }} [opts]
+ * @param {{ from?: string, to?: string, agentId?: *, atDial?: boolean }} [opts]
  */
 async function primeOutboundLive(callSid, opts = {}) {
   if (!callSid) {
     return null;
   }
+
+  const atDial = Boolean(opts.atDial);
 
   let session = sessions.get(callSid);
   if (!session) {
@@ -1799,6 +1927,7 @@ async function primeOutboundLive(callSid, opts = {}) {
     if (opts.to) session.to = opts.to;
   }
 
+  // Already primed (dial or answer) — no second Live connect / greeting.
   if (session.liveSession || session.greeted) {
     return session;
   }
@@ -1809,32 +1938,56 @@ async function primeOutboundLive(callSid, opts = {}) {
     return session;
   }
 
+  if (atDial) {
+    session.primedAtDial = true;
+    logger.info(
+      'OUTBOUND_GREETING',
+      `[OUTBOUND_GREETING] state=RINGING action=BUFFER_ONLY callSid=${callSid}`
+    );
+    logger.info('LIVE', `dial_prime_started callSid=${callSid}`);
+  } else {
+    logFirstResponse(session, 'prime_started');
+  }
+
   session.connecting = true;
-  logFirstResponse(session, 'prime_started');
 
   session.primePromise = (async () => {
     try {
       await loadAgentOntoSession(session, opts.agentId);
-      logFirstResponse(session, 'agent_loading_completed');
+      if (atDial) {
+        logger.info('LIVE', `dial_prime_agent_loaded callSid=${callSid}`);
+      } else {
+        logFirstResponse(session, 'agent_loading_completed');
+      }
 
-      // DB status marks must not delay greeting.
-      callService.markAnswered(callSid, null).catch(() => {});
-      callService.markInProgress(callSid).catch(() => {});
-      dashboardSocket.broadcast({
-        type: 'CALL_CONNECTED',
-        data: {
-          callSid,
-          from: session.from,
-          to: session.to,
-          status: 'connected',
-          sessionId: null,
-        },
-      });
+      // DB / dashboard "connected" only after answer — never while ringing.
+      if (!atDial) {
+        callService.markAnswered(callSid, null).catch(() => {});
+        callService.markInProgress(callSid).catch(() => {});
+        dashboardSocket.broadcast({
+          type: 'CALL_CONNECTED',
+          data: {
+            callSid,
+            from: session.from,
+            to: session.to,
+            status: 'connected',
+            sessionId: null,
+          },
+        });
+      }
 
-      logFirstResponse(session, 'prime_gemini_connect_started');
+      if (atDial) {
+        logger.info(
+          'LIVE',
+          `dial_prime_gemini_connect_started callSid=${callSid}`
+        );
+      } else {
+        logFirstResponse(session, 'prime_gemini_connect_started');
+      }
+
       const { liveSession, listenerEpoch } = await openGeminiLiveForCall(
         session,
-        'prime'
+        atDial ? 'dial_prime' : 'prime'
       );
 
       if (session.ending || !sessions.has(callSid)) {
@@ -1848,7 +2001,14 @@ async function primeOutboundLive(callSid, opts = {}) {
 
       session.liveSession = liveSession;
       session.reconnectAttempts = 0;
-      logFirstResponse(session, 'prime_gemini_connected');
+      if (atDial) {
+        logger.info(
+          'LIVE',
+          `dial_prime_gemini_connected callSid=${callSid}`
+        );
+      } else {
+        logFirstResponse(session, 'prime_gemini_connected');
+      }
 
       if (!session.greeted) {
         session.greeted = true;
@@ -1856,11 +2016,22 @@ async function primeOutboundLive(callSid, opts = {}) {
           liveSession,
           buildGreetingInstruction()
         );
-        logFirstResponse(session, 'prime_greeting_requested');
-        logger.info(
-          'LIVE',
-          `greeting primed once callSid=${callSid} epoch=${listenerEpoch}`
-        );
+        if (atDial) {
+          logger.info(
+            'LIVE',
+            `dial_prime_greeting_requested callSid=${callSid} epoch=${listenerEpoch}`
+          );
+          logger.info(
+            'LIVE',
+            `greeting primed once callSid=${callSid} epoch=${listenerEpoch} atDial=true`
+          );
+        } else {
+          logFirstResponse(session, 'prime_greeting_requested');
+          logger.info(
+            'LIVE',
+            `greeting primed once callSid=${callSid} epoch=${listenerEpoch}`
+          );
+        }
       }
       return session;
     } catch (error) {
@@ -1932,12 +2103,16 @@ async function startLiveCall({
     session.primePromise = null;
   }
 
-  // Primed path: attach Twilio WS and flush buffered greeting audio.
+  // Primed path: attach Twilio WS; flush only if greeting was not already Played.
   if (session.liveSession) {
     session.twilioWs = twilioWs;
     session.streamSid = streamSid || session.streamSid;
     logFirstResponse(session, 'media_attached_to_prime');
-    flushPendingOutboundPcm(session);
+    if (!session.greetingPlayedViaTwiml) {
+      flushPendingOutboundPcm(session);
+    } else {
+      session.pendingOutboundPcm = [];
+    }
     callService.markAnswered(callSid, streamSid).catch(() => {});
     callService.markInProgress(callSid).catch(() => {});
     dashboardSocket.broadcast({
@@ -2325,6 +2500,10 @@ module.exports = {
   getSessionByWs,
   startLiveCall,
   primeOutboundLive,
+  hasOutboundGreetingClip,
+  authorizeOutboundGreetingPlay,
+  consumeOutboundGreetingClip,
+  maybeFinalizeOutboundGreetingClip,
   forwardTwilioMedia,
   endLiveCall,
   clearTwilioPlayback,
