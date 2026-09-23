@@ -166,6 +166,89 @@ describe('forwardTwilioMedia always forwards real PCM', () => {
       geminiLiveService.sendPcm16kAudio = original;
     }
   });
+
+  it('forwards PCM after barge-in clear while waiting remains false', () => {
+    const sent = [];
+    const original = geminiLiveService.sendPcm16kAudio;
+    geminiLiveService.sendPcm16kAudio = (_live, pcm) => {
+      sent.push(Buffer.from(pcm));
+    };
+    try {
+      const session = {
+        callSid: 'CA_BARGE_FWD',
+        liveSession: { mock: true },
+        forwardAudio: true,
+        waiting: false,
+        aiSpeaking: false,
+        suppressStaleOutput: true,
+        playbackGeneration: 3,
+        inboundMediaCount: 0,
+        inboundMulawBytes: 0,
+        geminiInCount: 0,
+        geminiPcmBytes: 0,
+        gatedDropCount: 0,
+        speechLabeledCount: 0,
+        speechGate: createSpeechGateState(),
+        streamSid: 'MZ_FWD',
+        twilioWs: { readyState: 1, send() {} },
+        outboundRemainder: Buffer.alloc(0),
+      };
+      liveCallSession.clearTwilioPlayback(session);
+      const silenceMulawB64 = Buffer.alloc(160, 0xff).toString('base64');
+      liveCallSession.forwardTwilioMedia(session, silenceMulawB64);
+      assert.equal(sent.length, 1);
+      assert.equal(session.geminiInCount, 1);
+      assert.ok(session.geminiPcmBytes > 0);
+      assert.ok(session.inboundMulawBytes > 0);
+    } finally {
+      geminiLiveService.sendPcm16kAudio = original;
+    }
+  });
+
+  it('AUDIO_PATH_HEALTH ratio near 1.0 when frames are forwarded', () => {
+    const original = geminiLiveService.sendPcm16kAudio;
+    geminiLiveService.sendPcm16kAudio = () => {};
+    try {
+      const session = {
+        callSid: 'CA_PATH_HEALTH',
+        liveSession: { mock: true },
+        forwardAudio: true,
+        waiting: false,
+        aiSpeaking: false,
+        inboundMediaCount: 0,
+        inboundMulawBytes: 0,
+        geminiInCount: 0,
+        geminiPcmBytes: 0,
+        audioForwardSkipped: 0,
+        gatedDropCount: 0,
+        speechLabeledCount: 0,
+        speechGate: createSpeechGateState(),
+      };
+      const silenceMulawB64 = Buffer.alloc(160, 0xff).toString('base64');
+      for (let i = 0; i < 50; i += 1) {
+        liveCallSession.forwardTwilioMedia(session, silenceMulawB64);
+      }
+      const health = liveCallSession.computeAudioPathHealth(session);
+      assert.equal(health.inboundFrames, 50);
+      assert.equal(health.geminiFrames, 50);
+      assert.equal(health.skipped, 0);
+      assert.equal(health.classification, 'ok');
+      assert.ok(health.ratio >= 0.95 && health.ratio <= 1.05);
+    } finally {
+      geminiLiveService.sendPcm16kAudio = original;
+    }
+  });
+
+  it('does not invent company phonetic corrections in liveCallSession source', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const src = fs.readFileSync(
+      path.join(__dirname, '../src/services/liveCallSession.js'),
+      'utf8'
+    );
+    assert.doesNotMatch(src, /Josid|ZUSIT|Joshit|Juiced\s*Fuel/i);
+    assert.match(src, /AUDIO_PATH_HEALTH/);
+  });
 });
 
 describe('wait-hold recovery', () => {
@@ -188,7 +271,7 @@ describe('wait-hold recovery', () => {
     assert.equal(session.forwardAudio, true);
   });
 
-  it('speech after wait clears waiting so next utterance can proceed', () => {
+  it('speechGate accept after wait does NOT clear waiting', () => {
     const sent = [];
     const original = geminiLiveService.sendPcm16kAudio;
     geminiLiveService.sendPcm16kAudio = (_live, pcm) => {
@@ -207,7 +290,7 @@ describe('wait-hold recovery', () => {
         geminiInCount: 0,
         speechGate: createSpeechGateState(),
       };
-      // Sustained speech-like 16k PCM → 8k μ-law for Twilio media frames.
+      // Sustained speech-like frames must keep PCM flowing but not end WAIT.
       const speech16k = makeSpeechLikePcm16k(3200, 4000);
       const speech8k = resamplePcm16(speech16k, 16000, 8000);
       const mulaw = pcm16ToMulaw(speech8k);
@@ -217,7 +300,7 @@ describe('wait-hold recovery', () => {
         liveCallSession.forwardTwilioMedia(session, b64);
       }
       assert.ok(sent.length > 0);
-      assert.equal(session.waiting, false);
+      assert.equal(session.waiting, true);
       assert.equal(session.forwardAudio, true);
       assert.ok(session.speechLabeledCount >= 1);
     } finally {
@@ -239,6 +322,95 @@ describe('wait-hold recovery', () => {
     );
     assert.equal(session.waiting, false);
     assert.equal(session.forwardAudio, true);
+  });
+
+  it('noise fragment de while waiting does not clear waiting or become history', async () => {
+    const session = {
+      callSid: 'CA_WAIT_DE',
+      liveSession: null,
+      waiting: true,
+      waitPhase: 'WAITING',
+      forwardAudio: true,
+      history: [],
+    };
+    await liveCallSession.onCallerUtterance(session, 'de');
+    assert.equal(session.waiting, true);
+    assert.equal(session.waitPhase, 'WAITING');
+    assert.equal(session.history.length, 0);
+  });
+
+  it('repeat wait while waiting stays waiting and clears playback', async () => {
+    const clears = [];
+    const session = {
+      callSid: 'CA_WAIT_REPEAT',
+      liveSession: {
+        sendRealtimeInput() {},
+        close() {
+          session._closed = true;
+        },
+      },
+      waiting: true,
+      forwardAudio: true,
+      history: [],
+      streamSid: 'MZ_WAIT',
+      playbackGeneration: 2,
+      outboundRemainder: Buffer.alloc(0),
+      twilioWs: {
+        readyState: 1,
+        send(raw) {
+          clears.push(JSON.parse(raw));
+        },
+      },
+    };
+    await liveCallSession.onCallerUtterance(session, 'hold on');
+    assert.equal(session.waiting, true);
+    assert.equal(session.forwardAudio, true);
+    assert.ok(session.playbackGeneration > 2);
+    assert.ok(clears.some((m) => m.event === 'clear'));
+    assert.equal(session._closed, undefined);
+  });
+
+  it('wait while AI speaking clears Twilio and never ends the call', async () => {
+    const clears = [];
+    let endCalled = false;
+    const session = {
+      callSid: 'CA_WAIT_SPEAKING',
+      liveSession: {
+        sendRealtimeInput() {},
+        close() {
+          session._closed = true;
+        },
+      },
+      waiting: false,
+      forwardAudio: true,
+      aiSpeaking: true,
+      history: [],
+      streamSid: 'MZ_SPEAK',
+      playbackGeneration: 0,
+      outboundRemainder: Buffer.alloc(0),
+      suppressStaleOutput: false,
+      twilioWs: {
+        readyState: 1,
+        send(raw) {
+          clears.push(JSON.parse(raw));
+        },
+      },
+    };
+    const originalEnd = liveCallSession.endLiveCall;
+    liveCallSession.endLiveCall = async () => {
+      endCalled = true;
+    };
+    try {
+      await liveCallSession.onCallerUtterance(session, 'wait a second');
+      assert.equal(session.waiting, true);
+      assert.equal(session.aiSpeaking, false);
+      assert.equal(session.suppressStaleOutput, true);
+      assert.ok(clears.some((m) => m.event === 'clear'));
+      assert.equal(endCalled, false);
+      assert.equal(session._closed, undefined);
+    } finally {
+      liveCallSession.endLiveCall = originalEnd;
+    }
   });
 });
 
@@ -263,6 +435,10 @@ describe('Gemini Live VAD config', () => {
     assert.equal(
       cfg.automaticActivityDetection.endOfSpeechSensitivity,
       EndSensitivity.END_SENSITIVITY_HIGH
+    );
+    assert.equal(
+      cfg.automaticActivityDetection.startOfSpeechSensitivity,
+      StartSensitivity.START_SENSITIVITY_LOW
     );
     assert.equal(cfg.automaticActivityDetection.prefixPaddingMs, 150);
     assert.equal(cfg.automaticActivityDetection.silenceDurationMs, 500);
@@ -418,6 +594,9 @@ describe('interrupt stale audio', () => {
     assert.ok(!sent.some((m) => m.event === 'clear'));
     assert.equal(session.forwardAudio, true);
     assert.equal(session.waiting, false);
+    assert.equal(session.suppressStaleOutput, true);
+    assert.equal(session.aiSpeaking, false);
+    assert.equal(session.playbackGeneration, 1);
   });
 
   it('debounces repeated Twilio clear within window', () => {

@@ -32,7 +32,8 @@ describe('phone prompt and env wiring', () => {
     assert.match(mid, /Do not greet again|Do not re-introduce/i);
     assert.match(mid, /Background noise|prefer no spoken reply/i);
     assert.match(mid, /Imperfect but meaningful English/i);
-    assert.match(mid, /Genuine caller barge-in|Do-not-call/i);
+    assert.match(mid, /Genuine caller barge-in|Do-not-call|noise cut-off/i);
+    assert.match(mid, /New named entity|previous topic's facts/i);
     assert.doesNotMatch(mid, /Parker|JPLoft/i);
 
     const greet = buildGreetingInstruction();

@@ -157,14 +157,14 @@ function buildLiveConfig(options = {}) {
             name: 'searchKnowledge',
             behavior: 'BLOCKING',
             description:
-              'Search the indexed Agent knowledge for facts needed to answer the caller. Pass a concise query that states the caller\'s intended meaning and relevant conversational context (topic, entity, follow-up sense) — not raw filler or noise. Use for company facts, products, services, policies, pricing, procedures, and operating rules. Skip for pure greetings or small talk. The tool returns found plus snippet texts; if found is true and snippets answer the question, speak that answer.',
+              'Search the indexed Agent knowledge for facts needed to answer the caller. Pass a concise query that states the caller\'s intended meaning and relevant conversational context (topic, entity, follow-up sense) — not raw filler or noise. For leadership questions (founder, chief executive, owner, president) about the same company, include related role terms in the query so retrieval is not limited to one title. Use for company facts, products, services, policies, pricing, procedures, and operating rules. Skip for pure greetings or small talk. The tool returns found plus snippet texts; if found is true and snippets answer the question, speak that answer.',
             parameters: {
               type: 'OBJECT',
               properties: {
                 query: {
                   type: 'STRING',
                   description:
-                    "Concise search query: intended meaning of the caller's question plus short context when it is a follow-up (e.g. prior product or topic).",
+                    "Concise search query: intended meaning of the caller's question plus short context when it is a follow-up (e.g. prior product or topic). For who-leads questions, include related titles (founder, chief executive, owner, president) with the company name.",
                 },
               },
               required: ['query'],

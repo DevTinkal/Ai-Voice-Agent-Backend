@@ -10,7 +10,13 @@ const knowledgeService = require('./knowledgeService');
 const { env } = require('../config/env');
 const dashboardSocket = require('../websocket/dashboardSocket');
 const geminiLiveService = require('./geminiLiveService');
-const { isWaitHold, isResume } = require('../utils/waitIntent');
+const {
+  isWaitHold,
+  isResume,
+  isHoldNoiseFragment,
+  isIncompleteWaitPrefix,
+  normalize: normalizeWaitText,
+} = require('../utils/waitIntent');
 const {
   mulaw8kToPcm16k,
   pcm24kToMulaw8k,
@@ -22,6 +28,12 @@ const {
   evaluateFrame,
   isBargeInConfirmed,
 } = require('../utils/speechGate');
+const {
+  createPcmBatchState,
+  pushPcmBatch,
+  flushPcmBatch,
+  summarizePcmBatch,
+} = require('../utils/pcmBatcher');
 const { buildGreetingInstruction } = require('../config/prompts');
 const logger = require('../utils/logger');
 
@@ -55,6 +67,11 @@ function isNoiseTranscript(text) {
   }
   // Pure punctuation / filler noise from STT on background audio.
   if (/^[\s.!?…,;:\-_"'`~]+$/.test(raw)) {
+    return true;
+  }
+  // Tiny hold-noise fragments (de/yo/uh) must not become CALLER_MESSAGE
+  // and must not resume WAIT.
+  if (isHoldNoiseFragment(raw)) {
     return true;
   }
   return false;
@@ -418,6 +435,11 @@ function createEmptySession(callSid, twilioWs, streamSid, from, to) {
     history: [],
     historyLoaded: true,
     waiting: false,
+    /** WAIT state machine: NORMAL | WAITING */
+    waitPhase: 'NORMAL',
+    waitEnteredAt: null,
+    waitPhrase: null,
+    waitStreamEndSent: false,
     forwardAudio: true,
     inputTranscriptBuffer: '',
     outputTranscriptBuffer: '',
@@ -426,10 +448,15 @@ function createEmptySession(callSid, twilioWs, streamSid, from, to) {
     geminiChunkCount: 0,
     twilioFrameCount: 0,
     inboundMediaCount: 0,
+    inboundMulawBytes: 0,
     gatedDropCount: 0,
     speechLabeledCount: 0,
     silenceReplacedCount: 0,
     geminiInCount: 0,
+    geminiPcmBytes: 0,
+    audioForwardSkipped: 0,
+    /** Optional PCM batching toward Gemini (default 0 = immediate). */
+    pcmBatch: createPcmBatchState(env.geminiPcmBatchMs),
     gateWarnLogged: false,
     audioGateLogAt: 0,
     audioGateLogMsg: '',
@@ -543,8 +570,8 @@ function clearTwilioPlayback(session) {
 }
 
 /**
- * Gemini interrupted: clear Twilio only when barge-in is gate-confirmed
- * (or AI was speaking with an open gate) and clear debounce allows.
+ * Gemini interrupted: clear Twilio only when barge-in is speechGate-confirmed
+ * and clear debounce allows. Brief noise while AI speaks must not clear playback.
  * Never mutes caller PCM / never sets waiting from noise.
  */
 function handleGeminiInterrupted(session) {
@@ -572,8 +599,8 @@ function handleGeminiInterrupted(session) {
   });
   const aiWasSpeaking = Boolean(session.aiSpeaking);
   const gateOpen = Boolean(gate && gate.open);
-  const shouldClear =
-    !withinDebounce && (confirmed || (aiWasSpeaking && gateOpen));
+  // Confirm-only: do not clear on aiSpeaking+gateOpen alone (noise spikes).
+  const shouldClear = !withinDebounce && confirmed;
 
   if (shouldClear) {
     logger.info(
@@ -592,14 +619,12 @@ function handleGeminiInterrupted(session) {
         withinDebounce ? 'clear_debounce' : 'unconfirmed_noise'
       } confirmed=${confirmed} aiSpeaking=${aiWasSpeaking} gateOpen=${gateOpen}`
     );
-    // Still drop stale audio on this interrupted message without a second clear
-    // when debounce already cleared recently; bump generation so late chunks die.
-    if (withinDebounce) {
-      bumpPlaybackGeneration(session);
-      session.suppressStaleOutput = true;
-      session.aiSpeaking = false;
-      session.turnFirstAudioLogged = false;
-    }
+    // Drop stale Gemini chunks from the aborted turn so noise interrupts
+    // do not scramble the next playback (debounce and unconfirmed noise).
+    bumpPlaybackGeneration(session);
+    session.suppressStaleOutput = true;
+    session.aiSpeaking = false;
+    session.turnFirstAudioLogged = false;
   }
 }
 
@@ -619,7 +644,7 @@ function playGeminiPcmOnce(session, pcmBuffer, generationAtEnqueue) {
   if (!session.streamSid || !session.twilioWs || session.twilioWs.readyState !== 1) {
     return;
   }
-  if (session.waiting) {
+  if (session.waiting || session.waitPhase === 'WAITING') {
     return;
   }
 
@@ -897,28 +922,20 @@ function handleLiveMessage(session, message, listenerEpoch) {
     return;
   }
 
+  // Process caller transcripts BEFORE interrupt early-out so WAIT text on the
+  // same message is never dropped.
+  applyCallerTranscriptUpdate(session, parsed);
+  maybeEnterWaitFromStreaming(session);
+
   if (parsed.interrupted) {
+    logWaitTrace(session, {
+      stage: 'INTERRUPT',
+      text: session.inputTranscriptBuffer || '',
+      action: isSessionWaiting(session) ? 'KEEP_WAITING_AFTER_INTERRUPT' : 'BARGE_IN_ONLY',
+    });
     handleGeminiInterrupted(session);
     // Do not play any audio that arrived on the same interrupted message.
-    return;
-  }
-
-  // --- Caller transcript (must finalize before AI audio/text for dashboard order) ---
-  // Gemini JS SDK often never sets inputTranscription.finished — do not rely on it alone.
-  if (parsed.inputTranscription) {
-    session.inputTranscriptBuffer =
-      (session.inputTranscriptBuffer || '') + parsed.inputTranscription;
-    broadcastCallerStreaming(session, session.inputTranscriptBuffer);
-  }
-  if (parsed.interimInputTranscription) {
-    broadcastCallerStreaming(session, parsed.interimInputTranscription);
-    if (
-      !session.inputTranscriptBuffer ||
-      parsed.interimInputTranscription.length >=
-        session.inputTranscriptBuffer.length
-    ) {
-      session.inputTranscriptBuffer = parsed.interimInputTranscription;
-    }
+    // Still allow flush of a completed WAIT utterance below if appropriate.
   }
 
   const modelAlreadyReplying =
@@ -926,18 +943,39 @@ function handleLiveMessage(session, message, listenerEpoch) {
     session.turnGeminiFirstAudioAt != null ||
     session.aiSpeaking;
 
-  const shouldFlushInput =
-    parsed.inputFinished ||
-    parsed.userActivityEnd ||
-    Boolean(parsed.outputTranscription) ||
-    parsed.turnComplete ||
-    (parsed.audioBuffers && parsed.audioBuffers.length > 0) ||
-    (modelAlreadyReplying &&
-      Boolean(
-        parsed.inputTranscription || parsed.interimInputTranscription
-      ));
+  const bufNow = String(session.inputTranscriptBuffer || '').trim();
+  const deferFlushForWaitPrefix =
+    Boolean(bufNow) &&
+    isIncompleteWaitPrefix(bufNow) &&
+    !parsed.inputFinished &&
+    !parsed.userActivityEnd;
 
-  if (shouldFlushInput && (session.inputTranscriptBuffer || '').trim()) {
+  const shouldFlushInput =
+    !deferFlushForWaitPrefix &&
+    (parsed.inputFinished ||
+      parsed.userActivityEnd ||
+      Boolean(parsed.outputTranscription) ||
+      parsed.turnComplete ||
+      // AI audio may arrive before outputTranscription — flush caller text then,
+      // but never while the buffer is still an incomplete WAIT prefix ("wa").
+      (Boolean(parsed.audioBuffers && parsed.audioBuffers.length > 0) &&
+        !isIncompleteWaitPrefix(bufNow)) ||
+      (modelAlreadyReplying &&
+        Boolean(
+          parsed.inputTranscription || parsed.interimInputTranscription
+        ) &&
+        !isIncompleteWaitPrefix(bufNow)));
+
+  if (deferFlushForWaitPrefix) {
+    logWaitTrace(session, {
+      stage: 'STREAMING',
+      text: bufNow,
+      detected: false,
+      action: 'DEFER_FLUSH_PREFIX',
+    });
+  }
+
+  if (shouldFlushInput && bufNow) {
     flushInputTranscript(session).catch((error) => {
       logger.error('LIVE', `flushInputTranscript: ${error.message}`);
     });
@@ -957,10 +995,12 @@ function handleLiveMessage(session, message, listenerEpoch) {
     session.lastUserTurnEndAt = t;
   }
 
-  // --- AI audio playback ---
-  const generation = session.playbackGeneration;
-  for (const pcm of parsed.audioBuffers) {
-    playGeminiPcmOnce(session, pcm, generation);
+  // --- AI audio playback (skipped entirely on interrupted messages) ---
+  if (!parsed.interrupted) {
+    const generation = session.playbackGeneration;
+    for (const pcm of parsed.audioBuffers) {
+      playGeminiPcmOnce(session, pcm, generation);
+    }
   }
 
   if (parsed.turnComplete) {
@@ -970,7 +1010,17 @@ function handleLiveMessage(session, message, listenerEpoch) {
   }
 
   // --- AI transcript ---
-  if (parsed.outputTranscription) {
+  // While WAIT is active, do not stream/finalize AI text (keeps UI on Waiting).
+  if (isSessionWaiting(session)) {
+    if (parsed.outputTranscription || (parsed.audioBuffers && parsed.audioBuffers.length)) {
+      logWaitTrace(session, {
+        stage: 'SUPPRESS_AI',
+        text: '',
+        action: 'DROP_OUTPUT_WHILE_WAITING',
+      });
+    }
+    session.outputTranscriptBuffer = '';
+  } else if (parsed.outputTranscription) {
     session.outputTranscriptBuffer =
       (session.outputTranscriptBuffer || '') + parsed.outputTranscription;
     dashboardSocket.broadcast({
@@ -1014,6 +1064,89 @@ function debugTranscriptSnippet(text, maxLen = 200) {
   return `${s.slice(0, maxLen)}…`;
 }
 
+function isSessionWaiting(session) {
+  return Boolean(
+    session && (session.waiting || session.waitPhase === 'WAITING')
+  );
+}
+
+/**
+ * Structured WAIT diagnostics for real-call investigation (text only).
+ * @param {object} session
+ * @param {object} fields
+ */
+function logWaitTrace(session, fields = {}) {
+  if (!session) {
+    return;
+  }
+  const text = debugTranscriptSnippet(fields.text != null ? fields.text : '', 80);
+  const normalized = normalizeWaitText(fields.text != null ? fields.text : '');
+  const detected =
+    fields.detected != null
+      ? Boolean(fields.detected)
+      : normalized
+        ? isWaitHold(normalized)
+        : false;
+  const waitingBefore =
+    fields.waiting_before != null
+      ? Boolean(fields.waiting_before)
+      : isSessionWaiting(session);
+  logger.info(
+    'LIVE',
+    `[WAIT_TRACE] callSid=${session.callSid || '?'} stage=${fields.stage || '?'}` +
+      ` text="${String(text).replace(/"/g, "'")}"` +
+      ` normalized="${String(normalized || '').slice(0, 80).replace(/"/g, "'")}"` +
+      ` detected=${detected}` +
+      ` waiting_before=${waitingBefore}` +
+      ` waiting_after=${
+        fields.waiting_after != null
+          ? Boolean(fields.waiting_after)
+          : isSessionWaiting(session)
+      }` +
+      ` waitPhase=${session.waitPhase || 'NORMAL'}` +
+      ` aiSpeaking=${Boolean(session.aiSpeaking)}` +
+      ` playbackCleared=${Boolean(fields.playbackCleared)}` +
+      ` action=${fields.action || '?'}`
+  );
+}
+
+/**
+ * Apply Gemini input/interim transcription into the session buffer.
+ * @param {object} session
+ * @param {object} parsed
+ */
+function applyCallerTranscriptUpdate(session, parsed) {
+  if (!session || !parsed) {
+    return;
+  }
+  // Gemini JS SDK often never sets inputTranscription.finished — do not rely on it alone.
+  if (parsed.inputTranscription) {
+    session.inputTranscriptBuffer =
+      (session.inputTranscriptBuffer || '') + parsed.inputTranscription;
+    broadcastCallerStreaming(session, session.inputTranscriptBuffer);
+    logWaitTrace(session, {
+      stage: 'STREAMING',
+      text: session.inputTranscriptBuffer,
+      action: 'INPUT_APPEND',
+    });
+  }
+  if (parsed.interimInputTranscription) {
+    broadcastCallerStreaming(session, parsed.interimInputTranscription);
+    if (
+      !session.inputTranscriptBuffer ||
+      parsed.interimInputTranscription.length >=
+        session.inputTranscriptBuffer.length
+    ) {
+      session.inputTranscriptBuffer = parsed.interimInputTranscription;
+    }
+    logWaitTrace(session, {
+      stage: 'STREAMING',
+      text: session.inputTranscriptBuffer,
+      action: 'INTERIM_SET',
+    });
+  }
+}
+
 async function flushInputTranscript(session) {
   const input = (session.inputTranscriptBuffer || '').trim();
   session.inputTranscriptBuffer = '';
@@ -1025,28 +1158,36 @@ async function flushInputTranscript(session) {
       session,
       `background/noise rejected reason=noise_transcript text="${debugTranscriptSnippet(input, 40)}"`
     );
+    logWaitTrace(session, {
+      stage: 'NOISE',
+      text: input,
+      detected: false,
+      action: isSessionWaiting(session) ? 'KEEP_WAITING' : 'DROP_NOISE',
+    });
     return;
   }
   session.debugTurnSeq = (session.debugTurnSeq || 0) + 1;
-  // Speech-understanding diag: compare this STT side-channel with [AI_RESPONSE],
-  // [BARGE_IN_*], and tool queries before changing VAD (see geminiLiveService
-  // buildRealtimeInputConfig). Partial mid-sentence text ⇒ possible early VAD.
   logger.info(
     'LIVE',
     `[VOICE_TURN] callSid=${session.callSid} turn=${session.debugTurnSeq} caller="${debugTranscriptSnippet(input)}"`
   );
-  // Side-channel only: Live replies from caller AUDIO, not this text.
   logger.info(
     'MULTILINGUAL_DEBUG',
     `caller_input_transcription call=${session.callSid} turn=${session.debugTurnSeq} text="${debugTranscriptSnippet(input)}" note=dashboard_stt_side_channel_not_fed_as_text_to_model`
   );
+  logWaitTrace(session, {
+    stage: 'FINAL',
+    text: input,
+    detected: isWaitHold(input),
+    action: 'FLUSH_TO_UTTERANCE',
+  });
   await onCallerUtterance(session, input);
 }
 
 async function flushOutputTranscript(session) {
   const output = (session.outputTranscriptBuffer || '').trim();
   session.outputTranscriptBuffer = '';
-  if (!output || session.waiting) {
+  if (!output || isSessionWaiting(session)) {
     return;
   }
   logger.info(
@@ -1057,7 +1198,6 @@ async function flushOutputTranscript(session) {
     'MULTILINGUAL_DEBUG',
     `assistant_output_transcription call=${session.callSid} turn=${session.debugTurnSeq || '?'} text="${debugTranscriptSnippet(output)}" note=spoken_reply_side_channel`
   );
-  // Transcripts are for Mongo/dashboard only — never synthesize speech from them.
   pushHistory(session, 'assistant', output);
   saveMessage(session.callSid, 'assistant', output).catch(() => {});
   dashboardSocket.broadcast({
@@ -1075,7 +1215,166 @@ async function finalizeTranscripts(session) {
   await flushOutputTranscript(session);
 }
 
+/**
+ * Enter or refresh WAIT hold (playback pause only — PCM still forwards).
+ * Idempotent: duplicate enters only re-clear playback; one audioStreamEnd per entry.
+ * @param {object} session
+ * @param {string} text
+ * @param {'enter'|'repeat'|'early'} action
+ */
+function enterWaitHold(session, text, action = 'enter') {
+  if (!session) {
+    return;
+  }
+  const waitingBefore = isSessionWaiting(session);
+  const phrase = normalizeWaitText(text) || String(text || '').trim();
+
+  session.waiting = true;
+  session.waitPhase = 'WAITING';
+  session.forwardAudio = true;
+  session.waitPhrase = phrase || session.waitPhrase;
+  if (!waitingBefore) {
+    session.waitEnteredAt = nowMs();
+    session.waitStreamEndSent = false;
+  }
+  // Drop any in-flight AI text so it cannot clear the Waiting UI later.
+  session.outputTranscriptBuffer = '';
+
+  clearTwilioPlayback(session);
+  logWaitTrace(session, {
+    stage: 'CLEAR_PLAYBACK',
+    text: phrase,
+    waiting_before: waitingBefore,
+    waiting_after: true,
+    playbackCleared: true,
+    action: 'TWILIO_CLEAR',
+  });
+
+  try {
+    // First enter/early only: end user audio stream once per WAIT entry.
+    if (
+      session.liveSession &&
+      !session.waitStreamEndSent &&
+      action !== 'repeat'
+    ) {
+      flushCallerPcmBatch(session, 'wait_stream_end');
+      session.liveSession.sendRealtimeInput({ audioStreamEnd: true });
+      session.waitStreamEndSent = true;
+    }
+  } catch {
+    // ignore
+  }
+
+  dashboardSocket.broadcast({
+    type: 'AI_WAITING',
+    data: {
+      callSid: session.callSid,
+      reason: 'caller_hold',
+    },
+  });
+
+  const label = waitingBefore
+    ? 'REPEAT'
+    : action === 'early'
+      ? 'ENTER_WAIT_EARLY'
+      : 'ENTER_WAIT';
+  logWaitTrace(session, {
+    stage: waitingBefore ? 'REPEAT' : 'ENTER',
+    text: phrase,
+    detected: true,
+    waiting_before: waitingBefore,
+    waiting_after: true,
+    playbackCleared: true,
+    action: label,
+  });
+  logger.info(
+    'LIVE',
+    `[WAIT_HOLD] callSid=${session.callSid} action=${label.toLowerCase()} text="${String(
+      phrase
+    )
+      .slice(0, 80)
+      .replace(/"/g, "'")}" forwardAudio=true waiting=true waitPhase=WAITING`
+  );
+}
+
+/**
+ * Enter WAIT as soon as streaming/interim transcript matches a hold phrase.
+ * Leaves the buffer intact so flush still emits CALLER_MESSAGE.
+ * @param {object} session
+ */
+function maybeEnterWaitFromStreaming(session) {
+  if (!session) {
+    return;
+  }
+  const buf = String(session.inputTranscriptBuffer || '').trim();
+  const normalized = normalizeWaitText(buf);
+  if (!buf) {
+    return;
+  }
+  const detected = isWaitHold(buf);
+  if (!detected) {
+    if (isIncompleteWaitPrefix(buf)) {
+      logWaitTrace(session, {
+        stage: 'STREAMING',
+        text: buf,
+        detected: false,
+        action: 'PREFIX_PENDING',
+      });
+    }
+    return;
+  }
+  if (isSessionWaiting(session)) {
+    logWaitTrace(session, {
+      stage: 'STREAMING',
+      text: buf,
+      detected: true,
+      action: 'ALREADY_WAITING',
+    });
+    return;
+  }
+  logWaitTrace(session, {
+    stage: 'STREAMING',
+    text: buf,
+    detected: true,
+    normalized,
+    action: 'EARLY_DETECT',
+  });
+  enterWaitHold(session, buf, 'early');
+}
+
+function clearWaitState(session) {
+  if (!session) {
+    return;
+  }
+  session.waiting = false;
+  session.waitPhase = 'NORMAL';
+  session.waitEnteredAt = null;
+  session.waitPhrase = null;
+  session.waitStreamEndSent = false;
+}
+
 async function onCallerUtterance(session, text) {
+  // Tiny noise/fragments: never CALLER_MESSAGE and never clear WAIT.
+  if (isNoiseTranscript(text)) {
+    if (session && isSessionWaiting(session)) {
+      logWaitTrace(session, {
+        stage: 'NOISE',
+        text,
+        detected: false,
+        action: 'KEEP_WAITING',
+      });
+      logger.info(
+        'LIVE',
+        `[WAIT_HOLD] callSid=${session.callSid} action=ignore_noise text="${String(
+          text
+        )
+          .slice(0, 40)
+          .replace(/"/g, "'")}" waiting=true`
+      );
+    }
+    return;
+  }
+
   pushHistory(session, 'user', text);
   saveMessage(session.callSid, 'user', text).catch(() => {});
   dashboardSocket.broadcast({
@@ -1088,35 +1387,28 @@ async function onCallerUtterance(session, text) {
   callService.touchActivity(session.callSid).catch(() => {});
 
   if (isWaitHold(text)) {
-    // Pause AI playback only — never mute caller PCM to Gemini (that deadlocks
-    // recovery: no audio → no transcript → waiting never clears).
-    session.waiting = true;
-    session.forwardAudio = true;
-    clearTwilioPlayback(session);
-    try {
-      if (session.liveSession) {
-        session.liveSession.sendRealtimeInput({ audioStreamEnd: true });
-      }
-    } catch {
-      // ignore
-    }
-    dashboardSocket.broadcast({
-      type: 'AI_WAITING',
-      data: {
-        callSid: session.callSid,
-        reason: 'caller_hold',
-      },
-    });
-    logger.info(
-      'LIVE',
-      `[WAIT_HOLD] callSid=${session.callSid} forwardAudio=true waiting=true`
-    );
+    const alreadyWaiting = isSessionWaiting(session);
+    enterWaitHold(session, text, alreadyWaiting ? 'repeat' : 'enter');
     return;
   }
 
-  if (session.waiting) {
-    session.waiting = false;
+  if (isSessionWaiting(session)) {
+    clearWaitState(session);
     session.forwardAudio = true;
+    logWaitTrace(session, {
+      stage: 'RESUME',
+      text,
+      detected: false,
+      waiting_before: true,
+      waiting_after: false,
+      action: 'RESUME_MEANINGFUL',
+    });
+    logger.info(
+      'LIVE',
+      `[WAIT_HOLD] callSid=${session.callSid} action=resume text="${String(text)
+        .slice(0, 80)
+        .replace(/"/g, "'")}" waiting=false waitPhase=NORMAL`
+    );
     logger.info(
       'LIVE',
       `[AI_RESPONSE_RECOVERY] callSid=${session.callSid} reason=caller_utterance`
@@ -1327,6 +1619,9 @@ async function reconnectLiveSession(session, reason) {
   session.reconnecting = true;
   session.reconnectAttempts = (session.reconnectAttempts || 0) + 1;
 
+  // Flush pending caller PCM to the dying socket before close (no discard).
+  flushCallerPcmBatch(session, 'reconnect');
+
   const previous = session.liveSession;
   session.liveSession = null;
   // Drop any in-flight AI audio from the dying socket.
@@ -1533,9 +1828,143 @@ async function startLiveCall({
   }
 }
 
+/**
+ * Compute Twilio→Gemini audio path health (durations only; no payloads).
+ * @param {object} session
+ * @returns {{
+ *   inboundFrames: number,
+ *   geminiFrames: number,
+ *   twilioMs: number,
+ *   geminiMs: number,
+ *   ratio: number,
+ *   skipped: number,
+ *   classification: 'ok'|'possible_drop'|'no_audio'
+ * }}
+ */
+function computeAudioPathHealth(session) {
+  const inboundFrames = Number(session && session.inboundMediaCount) || 0;
+  const geminiFrames = Number(session && session.geminiInCount) || 0;
+  const mulawBytes = Number(session && session.inboundMulawBytes) || 0;
+  const pcmBytes = Number(session && session.geminiPcmBytes) || 0;
+  const skipped = Number(session && session.audioForwardSkipped) || 0;
+  // μ-law: 1 byte = 1 sample @ 8 kHz
+  const twilioMs = mulawBytes > 0 ? (mulawBytes / 8000) * 1000 : 0;
+  // PCM16: 2 bytes = 1 sample @ 16 kHz
+  const geminiMs = pcmBytes > 0 ? (pcmBytes / 2 / 16000) * 1000 : 0;
+  const ratio =
+    twilioMs > 0 ? Math.round((geminiMs / twilioMs) * 1000) / 1000 : 0;
+  let classification = 'no_audio';
+  if (twilioMs > 0 || geminiMs > 0) {
+    // Upsample loses ~1 sample/frame; ratio should stay near 1.0
+    classification = ratio >= 0.95 && ratio <= 1.05 ? 'ok' : 'possible_drop';
+  }
+  return {
+    inboundFrames,
+    geminiFrames,
+    twilioMs: Math.round(twilioMs),
+    geminiMs: Math.round(geminiMs),
+    ratio,
+    skipped,
+    classification,
+  };
+}
+
+function logAudioPathHealth(session, reason = 'call_end') {
+  if (!session) {
+    return;
+  }
+  const h = computeAudioPathHealth(session);
+  logger.info(
+    'LIVE',
+    `[AUDIO_PATH_HEALTH] callSid=${session.callSid || '?'} reason=${reason}` +
+      ` inboundFrames=${h.inboundFrames} geminiFrames=${h.geminiFrames}` +
+      ` twilioMs=${h.twilioMs} geminiMs=${h.geminiMs} ratio=${h.ratio}` +
+      ` skipped=${h.skipped} class=${h.classification}` +
+      ` waiting=${Boolean(session.waiting)}`
+  );
+}
+
+/**
+ * Ensure session has a PCM batch state (tests may omit createEmptySession).
+ * @param {object} session
+ */
+function ensurePcmBatch(session) {
+  if (!session) {
+    return null;
+  }
+  if (!session.pcmBatch) {
+    session.pcmBatch = createPcmBatchState(env.geminiPcmBatchMs);
+  }
+  return session.pcmBatch;
+}
+
+/**
+ * Hooks that send batched PCM to the current Live session.
+ * @param {object} session
+ */
+function pcmBatchHooks(session) {
+  return {
+    send(buf) {
+      if (!session || !session.liveSession) {
+        throw new Error('no_live_session');
+      }
+      geminiLiveService.sendPcm16kAudio(session.liveSession, buf);
+    },
+    scheduleFlush(ms, fn) {
+      return setTimeout(fn, ms);
+    },
+    clearFlush(timer) {
+      clearTimeout(timer);
+    },
+  };
+}
+
+/**
+ * Flush any pending PCM batch. Does NOT send audioStreamEnd.
+ * @param {object} session
+ * @param {string} [reason]
+ * @returns {number}
+ */
+function flushCallerPcmBatch(session, reason = 'flush') {
+  const state = ensurePcmBatch(session);
+  if (!state) {
+    return 0;
+  }
+  return flushPcmBatch(state, pcmBatchHooks(session), reason);
+}
+
+function logAudioBatchHealth(session, reason = 'call_end') {
+  if (!session) {
+    return;
+  }
+  const state = ensurePcmBatch(session);
+  const h = summarizePcmBatch(state);
+  logger.info(
+    'LIVE',
+    `[AUDIO_BATCH_HEALTH] callSid=${session.callSid || '?'} reason=${reason}` +
+      ` mode=${h.mode} input_ms=${h.inputMs} sent_ms=${h.sentMs}` +
+      ` batches=${h.batches} flush_count=${h.flushCount}` +
+      ` dropped_bytes=${h.droppedBytes} dropped_frames=${h.droppedFrames}` +
+      ` pending_bytes=${h.pendingBytes} ratio=${h.ratio}`
+  );
+}
+
+/**
+ * Queue or immediately send caller PCM16k to Gemini (optional batching).
+ * @param {object} session
+ * @param {Buffer} pcm16k
+ */
+function sendCallerPcmToGemini(session, pcm16k) {
+  const state = ensurePcmBatch(session);
+  pushPcmBatch(state, pcm16k, pcmBatchHooks(session));
+}
+
 function forwardTwilioMedia(session, payloadBase64) {
   // waiting must NOT block PCM — only forwardAudio=false (call end) stops input.
   if (!session || !session.liveSession || !session.forwardAudio) {
+    if (session) {
+      session.audioForwardSkipped = (session.audioForwardSkipped || 0) + 1;
+    }
     return;
   }
   if (!payloadBase64) {
@@ -1545,6 +1974,8 @@ function forwardTwilioMedia(session, payloadBase64) {
     session.inboundMediaCount = (session.inboundMediaCount || 0) + 1;
     session.lastCallerAudioAt = nowMs();
     const mulaw = Buffer.from(payloadBase64, 'base64');
+    session.inboundMulawBytes =
+      (session.inboundMulawBytes || 0) + mulaw.length;
     const pcm16k = mulaw8kToPcm16k(mulaw);
 
     if (!session.speechGate) {
@@ -1560,18 +1991,8 @@ function forwardTwilioMedia(session, payloadBase64) {
     if (decision.accept) {
       session.speechLabeledCount = (session.speechLabeledCount || 0) + 1;
       stampCallerSpeechForLatency(session, nowMs());
-      if (session.waiting) {
-        session.waiting = false;
-        session.forwardAudio = true;
-        logger.info(
-          'LIVE',
-          `[CALLER_SPEECH_AFTER_INTERRUPT] callSid=${session.callSid} reason=${decision.reason}`
-        );
-        logger.info(
-          'LIVE',
-          `[AI_RESPONSE_RECOVERY] callSid=${session.callSid} reason=speech_gate_accept`
-        );
-      }
+      // Do NOT clear session.waiting here — hangover/noise frames must not
+      // end WAIT. Resume only via onCallerUtterance (meaningful text).
       if (session.aiSpeaking) {
         logAudioGate(
           session,
@@ -1606,13 +2027,17 @@ function forwardTwilioMedia(session, payloadBase64) {
 
     session.lastGeminiInAt = nowMs();
     session.geminiInCount = (session.geminiInCount || 0) + 1;
+    session.geminiPcmBytes =
+      (session.geminiPcmBytes || 0) + pcm16k.length;
     if (session.geminiInCount === 1 || session.geminiInCount % 200 === 0) {
       logger.info(
         'LIVE',
         `[AUDIO_IN][GEMINI_INPUT] callSid=${session.callSid} frames=${session.geminiInCount} waiting=${Boolean(session.waiting)}`
       );
     }
-    geminiLiveService.sendPcm16kAudio(session.liveSession, pcm16k);
+    // Optional batching: GEMINI_PCM_BATCH_MS=0 → immediate (default).
+    // speechGate / WAIT never drop this PCM.
+    sendCallerPcmToGemini(session, pcm16k);
 
     // One-shot warn if almost nothing looks like speech after AI started talking.
     if (
@@ -1642,6 +2067,10 @@ async function endLiveCall(callSid, reason = 'stop') {
   clearReconnectTimer(session);
   bumpPlaybackGeneration(session);
 
+  // Flush remaining optional PCM batch before closing input (not audioStreamEnd).
+  flushCallerPcmBatch(session, 'end');
+  logAudioBatchHealth(session, reason);
+
   const live = session.liveSession;
   session.liveSession = null;
   closeLiveSessionQuietly(live);
@@ -1653,6 +2082,7 @@ async function endLiveCall(callSid, reason = 'stop') {
   }
 
   const gate = session.speechGate || {};
+  logAudioPathHealth(session, reason);
   logger.info(
     'LIVE',
     `stats callSid=${callSid} geminiChunks=${session.geminiChunkCount || 0} twilioFrames=${session.twilioFrameCount || 0} inbound=${session.inboundMediaCount || 0} geminiIn=${session.geminiInCount || 0} speechLabeled=${session.speechLabeledCount || 0} nonSpeechLabeled=${session.gatedDropCount || 0} gateFwd=${gate.forwardedFrames || 0}`
@@ -1703,6 +2133,12 @@ module.exports = {
   stampCallerSpeechForLatency,
   reconnectLiveSession,
   scheduleLiveReconnect,
+  computeAudioPathHealth,
+  logAudioPathHealth,
+  flushCallerPcmBatch,
+  logAudioBatchHealth,
+  ensurePcmBatch,
+  isSessionWaiting,
   LIVE_RECONNECT_MAX_ATTEMPTS,
   LATENCY_LOG_PATH,
   beginFirstResponseTimeline,

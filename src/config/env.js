@@ -50,7 +50,7 @@ const env = {
   dashboardWsUrl: process.env.DASHBOARD_WS_URL || '',
   skipTwilioSignature:
     String(process.env.SKIP_TWILIO_SIGNATURE || '').toLowerCase() === 'true',
-  vadStartSensitivity: process.env.VAD_START_SENSITIVITY || 'HIGH',
+  vadStartSensitivity: process.env.VAD_START_SENSITIVITY || 'LOW',
   vadEndSensitivity: process.env.VAD_END_SENSITIVITY || 'HIGH',
   vadPrefixPaddingMs: Number(process.env.VAD_PREFIX_PADDING_MS) || 150,
   vadSilenceDurationMs: Number(process.env.VAD_SILENCE_DURATION_MS) || 500,
@@ -60,6 +60,15 @@ const env = {
   /** Min ms between Twilio clear events on interrupt. */
   bargeInClearDebounceMs:
     Number(process.env.BARGE_IN_CLEAR_DEBOUNCE_MS) || 500,
+  /**
+   * Optional Gemini Live PCM input batching (ms). Default 0 = send each
+   * Twilio frame immediately (current production behavior). Set to 100 for
+   * the ~100 ms ASR experiment. Never enable by default without evidence.
+   */
+  geminiPcmBatchMs: Math.max(
+    0,
+    Math.floor(Number(process.env.GEMINI_PCM_BATCH_MS) || 0)
+  ),
 };
 
 function getVoiceWebhookUrl() {

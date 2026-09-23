@@ -155,7 +155,18 @@ describe('singleton Agent + Live thin wrapper', () => {
     assert.match(joined, /stop speaking immediately|Never talk over/i);
     assert.match(joined, /Yeah, absolutely/i);
     assert.match(joined, /Let me process that information/i);
+    assert.match(joined, /repeat your request in English|repeat in English/i);
+    assert.match(joined, /noise-related cut-off|cut off by noise|continue the prior topic/i);
     assert.match(joined, /CONVERSATION CONTEXT/);
+    assert.match(joined, /CURRENT USER TURN HAS PRIORITY/i);
+    assert.match(joined, /new named entity|NEW TOPIC/i);
+    assert.match(joined, /Could you clarify what GC2 refers to/i);
+    assert.match(joined, /Soft name variants|near-homophone/i);
+    assert.match(joined, /Mixed-language turns/i);
+    assert.match(joined, /previous topic/i);
+    assert.match(joined, /Caller WAIT|HOLD|call control/i);
+    assert.match(joined, /remain silent|stay silent/i);
+    assert.match(joined, /Leadership \/ role questions|founder.*owner.*president|interchangeable/i);
     assert.match(joined, /SMALL TALK/);
     assert.match(joined, /searchKnowledge/);
     assert.match(joined, /found=true/i);
@@ -189,7 +200,32 @@ describe('singleton Agent + Live thin wrapper', () => {
     assert.match(tech, /Background noise|prefer no spoken reply/i);
     assert.match(tech, /Imperfect but meaningful English/i);
     assert.match(tech, /Company facts and Agent Prompt|never invent company/i);
-    assert.match(tech, /Genuine caller barge-in|Do-not-call/i);
+    assert.match(tech, /Genuine caller barge-in|Do-not-call|noise cut-off/i);
+    assert.match(tech, /New named entity|previous topic's facts/i);
+  });
+
+  it('extractDomainSpeechHints pulls brands from Agent Prompt dynamically', () => {
+    const hints = agentService.extractDomainSpeechHints(
+      'Acme Juice Co was founded by Sam Rivera in Austin Texas. Contact Acme Juice.'
+    );
+    assert.ok(hints.some((t) => /Acme Juice/i.test(t)));
+    assert.ok(hints.some((t) => /Sam Rivera/i.test(t)));
+    assert.ok(hints.length <= agentService.MAX_DOMAIN_SPEECH_HINTS);
+
+    const joined = agentService.buildAgentSystemInstruction({
+      name: 'Red',
+      prompts: [
+        {
+          text: 'Brand ZetaFuel by Morgan Lee. Franchise in Denver Colorado.',
+        },
+      ],
+      languages: ['English'],
+    });
+    assert.match(joined, /DOMAIN SPEECH HINTS/);
+    assert.match(joined, /ZetaFuel|Morgan Lee|Denver/i);
+    assert.match(joined, /recognition and context hints only/i);
+    assert.doesNotMatch(joined, /Franchise in Denver Colorado/);
+    assert.ok(joined.length < 16000);
   });
 
   it('normalizeLanguages parses comma list and defaults English', () => {
@@ -232,14 +268,14 @@ describe('singleton Agent + Live thin wrapper', () => {
       makeAgentDoc({
         name: 'Ready',
         status: 'active',
-        prompts: ['Alpha', 'Beta'],
+        prompts: ['be helpful on calls.', 'stay concise when speaking.'],
       });
     const ok = await agentService.requireAgentForCall();
     assert.equal(ok.agentName, 'Ready');
     assert.match(ok.systemInstruction, /AGENT IDENTITY/);
     assert.match(ok.systemInstruction, /spoken name on this call is Ready/);
-    assert.doesNotMatch(ok.systemInstruction, /Alpha/);
-    assert.doesNotMatch(ok.systemInstruction, /Beta/);
+    assert.doesNotMatch(ok.systemInstruction, /be helpful on calls/);
+    assert.doesNotMatch(ok.systemInstruction, /stay concise when speaking/);
     assert.match(ok.systemInstruction, /LANGUAGE POLICY/);
     assert.match(ok.systemInstruction, /searchKnowledge/);
     assert.match(ok.systemInstruction, /English/);

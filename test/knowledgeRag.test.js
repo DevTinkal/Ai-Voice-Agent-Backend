@@ -214,6 +214,7 @@ describe('knowledge RAG — Live tool wiring', () => {
     assert.match(instruction, /reference material only/i);
     assert.match(instruction, /SPEECH UNDERSTANDING|UNDERSTANDING AND CLARIFICATION/);
     assert.match(instruction, /CONVERSATION CONTEXT/);
+    assert.match(instruction, /CURRENT USER TURN HAS PRIORITY|new named entity|NEW TOPIC/i);
     assert.match(instruction, /found=true/i);
     assert.match(instruction, /NOT UNDERSTOOD/i);
     assert.match(instruction, /NOISE|Prefer silence|background/i);

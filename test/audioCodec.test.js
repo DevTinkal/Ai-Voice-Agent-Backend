@@ -63,4 +63,29 @@ describe('audioCodec', () => {
     src.fill(0x22);
     assert.equal(frames[0][0], 0x11);
   });
+
+  it('mulaw8k→pcm16k preserves wall-clock duration (~1.0 ratio)', () => {
+    // 100 frames × 20ms = 2000ms @ 8k (160 bytes/frame)
+    const frames = 100;
+    const mulaw = Buffer.alloc(frames * 160, 0xff);
+    const twilioMs = (mulaw.length / 8000) * 1000;
+    const pcm16k = mulaw8kToPcm16k(mulaw);
+    const geminiMs = (pcm16k.length / 2 / 16000) * 1000;
+    const ratio = geminiMs / twilioMs;
+    assert.ok(
+      ratio >= 0.95 && ratio <= 1.05,
+      `duration ratio ${ratio} outside 0.95–1.05 (twilioMs=${twilioMs} geminiMs=${geminiMs})`
+    );
+    // PCM16 is 2 bytes/sample; ~2x sample rate → roughly 4x byte size, not collapsed
+    assert.ok(pcm16k.length > mulaw.length * 2);
+    assert.ok(pcm16k.length < mulaw.length * 5);
+  });
+
+  it('single 20ms Twilio frame converts without collapsing duration', () => {
+    const mulaw = Buffer.alloc(160, 0xff); // 20ms @ 8k
+    const pcm16k = mulaw8kToPcm16k(mulaw);
+    const pcmSamples = pcm16k.length / 2;
+    // Upsample (n-1)*2+1 → 319 samples ≈ 19.9ms @ 16k
+    assert.ok(pcmSamples >= 300 && pcmSamples <= 320);
+  });
 });

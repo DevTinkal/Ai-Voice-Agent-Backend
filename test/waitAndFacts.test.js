@@ -4,29 +4,72 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
-const { isWaitHold, isResume } = require('../src/utils/waitIntent');
+const { isWaitHold, isResume, isHoldNoiseFragment, isIncompleteWaitPrefix } = require('../src/utils/waitIntent');
 
 describe('waitIntent', () => {
-  it('detects simple wait', () => {
-    assert.equal(isWaitHold('wait'), true);
-    assert.equal(isWaitHold('Hold on'), true);
-    assert.equal(isWaitHold('please wait'), true);
+  it('detects all supported short WAIT phrases', () => {
+    const phrases = [
+      'wait',
+      'wait wait',
+      'wait a second',
+      'wait a minute',
+      'please wait',
+      'hold on',
+      'hold on a second',
+      'hang on',
+      'one moment',
+      'just a moment',
+      'give me a second',
+      'give me a moment',
+      'give me a minute',
+      'let me think',
+      'Wait.',
+      'HOLD ON',
+    ];
+    for (const p of phrases) {
+      assert.equal(isWaitHold(p), true, `expected WAIT for: ${p}`);
+    }
   });
 
-  it('detects compound wait phrases', () => {
-    assert.equal(isWaitHold('wait a second, please hold'), true);
-    assert.equal(isWaitHold('hang on one moment please'), true);
-    assert.equal(isWaitHold('give me a moment'), true);
+  it('rejects noise fragments and short non-wait speech', () => {
+    for (const p of ['yo', 'le', 'de', 'uh', 'hmm', 'random noise']) {
+      assert.equal(isWaitHold(p), false, `expected not WAIT for: ${p}`);
+      if (['yo', 'le', 'de', 'uh', 'hmm'].includes(p)) {
+        assert.equal(isHoldNoiseFragment(p), true, `expected noise fragment: ${p}`);
+      }
+    }
   });
 
-  it('does not treat project speech as wait', () => {
+  it('marks incomplete WAIT prefixes without treating them as hold', () => {
+    for (const p of ['w', 'wa', 'wai', 'ho', 'hol', 'hold o', 'give me', 'please w']) {
+      assert.equal(isWaitHold(p), false, `must not WAIT yet: ${p}`);
+      assert.equal(isIncompleteWaitPrefix(p), true, `expected prefix: ${p}`);
+    }
+    // Bare "hold"/"wait" are complete holds (repeat-token pattern), not prefixes.
+    assert.equal(isWaitHold('hold'), true);
+    assert.equal(isIncompleteWaitPrefix('hold'), false);
+    assert.equal(isIncompleteWaitPrefix('wait'), false);
+    assert.equal(isIncompleteWaitPrefix('de'), false);
+    assert.equal(isIncompleteWaitPrefix('What is the franchise fee'), false);
+  });
+
+  it('does not treat long questions containing wait as pure WAIT', () => {
+    assert.equal(
+      isWaitHold('Wait, what are the franchise requirements?'),
+      false
+    );
     assert.equal(isWaitHold('I need to build a healthcare app'), false);
     assert.equal(isWaitHold('What is your price for a project?'), false);
+    assert.equal(
+      isWaitHold('Please wait until I finish explaining the franchise cost'),
+      false
+    );
   });
 
   it('detects resume', () => {
     assert.equal(isResume('ok continue'), true);
     assert.equal(isResume("I'm back"), true);
+    assert.equal(isResume('continue'), true);
   });
 });
 
