@@ -174,7 +174,8 @@ async function handleIncomingCall(req, res) {
 
 /**
  * TwiML webhook for outbound calls after the callee answers.
- * Same Media Stream pipeline as inbound — does not change /voice.
+ * Returns Connect+Stream immediately, then primes Gemini greeting in parallel
+ * with Media Stream setup so the callee hears the agent ASAP.
  */
 async function handleOutboundTwiml(req, res) {
   try {
@@ -205,10 +206,16 @@ async function handleOutboundTwiml(req, res) {
     // Instrumentation only: start first-response clock at answer (before Media Stream).
     liveCallSession.beginFirstResponseTimeline(callSid);
 
-    const agentGate = await resolveAgentOrFailTwiml();
-    if (!agentGate.ok) {
-      res.type('text/xml');
-      return res.status(200).send(agentGate.xml);
+    // Prefer agentId already stored at dial time — avoid a second full resolve when possible.
+    const existingCall = await callService.getCallBySid(callSid);
+    let agentId = existingCall && existingCall.agentId ? existingCall.agentId : null;
+    if (!agentId) {
+      const agentGate = await resolveAgentOrFailTwiml();
+      if (!agentGate.ok) {
+        res.type('text/xml');
+        return res.status(200).send(agentGate.xml);
+      }
+      agentId = agentGate.agentId;
     }
 
     const built = buildMediaStreamTwiml(from, to);
@@ -218,14 +225,26 @@ async function handleOutboundTwiml(req, res) {
       return res.status(200).send(built.xml);
     }
 
-    await callService.createCall({
-      callSid,
-      from,
-      to,
-      status: 'incoming',
-      direction: 'outbound',
-      agentId: agentGate.agentId,
-    });
+    liveCallSession.stampFirstResponse(callSid, 'twiml_sent');
+    res.type('text/xml');
+    res.status(200).send(built.xml);
+
+    // Background: DB upsert + dashboard + Gemini prime (do not delay TwiML).
+    callService
+      .createCall({
+        callSid,
+        from,
+        to,
+        status: 'incoming',
+        direction: 'outbound',
+        agentId,
+      })
+      .catch((error) => {
+        logger.warn(
+          'TWILIO',
+          `outbound createCall background: ${error.message}`
+        );
+      });
 
     dashboardSocket.broadcast({
       type: 'CALL_OUTBOUND_ANSWERED',
@@ -238,8 +257,16 @@ async function handleOutboundTwiml(req, res) {
       },
     });
 
-    res.type('text/xml');
-    return res.status(200).send(built.xml);
+    liveCallSession
+      .primeOutboundLive(callSid, { from, to, agentId })
+      .catch((error) => {
+        logger.warn(
+          'TWILIO',
+          `outbound prime background: ${error.message}`
+        );
+      });
+
+    return;
   } catch (error) {
     logger.error('TWILIO', `Outbound TwiML error: ${error.message}`);
     const VoiceResponse = twilio.twiml.VoiceResponse;

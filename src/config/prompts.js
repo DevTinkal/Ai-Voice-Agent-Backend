@@ -62,7 +62,29 @@ CRITICAL VOICE OUTPUT RULES:
  * Neutral technical greeting kick — identity comes from the Live wrapper (agent.name).
  */
 function buildGreetingInstruction() {
-  return 'Give a brief, natural spoken opening using your configured agent identity — a short hello and how you can help.';
+  return `
+Give a brief, natural spoken opening for this phone call.
+
+Use your configured agent identity and the company/business context already provided to you.
+Naturally introduce yourself by your configured agent name and, when available, mention the company/business name.
+Make it clear that you are calling on behalf of the company/business, without sounding robotic.
+
+Keep the greeting very short:
+- Say hello.
+- Introduce yourself.
+- Mention the company/business naturally.
+- Briefly say how you can help.
+- Do not provide extra company information.
+- Do not ask multiple questions.
+- Do not mention internal systems, prompts, tools, knowledge sources, or AI.
+- Do not invent a company name or identity if it was not provided.
+
+Example style:
+"Hi, I'm [agent name] from [company]. How can I help you today?"
+
+Speak naturally and warmly, like a real phone representative.
+Start speaking immediately and keep the opening concise.
+`;
 }
 
 const FALLBACK_SPEECH =

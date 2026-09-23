@@ -8,6 +8,7 @@ const { env } = require('../src/config/env');
 const twilioVoiceService = require('../src/services/twilioVoiceService');
 const callService = require('../src/services/callService');
 const agentService = require('../src/services/agentService');
+const liveCallSession = require('../src/services/liveCallSession');
 const dashboardSocket = require('../src/websocket/dashboardSocket');
 const {
   buildMediaStreamTwiml,
@@ -74,6 +75,8 @@ describe('outbound call API and TwiML', () => {
   let prevFrom;
   let createCallArgs;
   let broadcastEvents;
+  /** When set, createCall awaits this before recording (TwiML must not wait). */
+  let createCallHold;
 
   before(async () => {
     prevSkip = env.skipTwilioSignature;
@@ -88,11 +91,21 @@ describe('outbound call API and TwiML', () => {
 
     createCallArgs = [];
     broadcastEvents = [];
+    createCallHold = null;
 
     mock.method(callService, 'createCall', async (data) => {
+      if (createCallHold) {
+        await createCallHold;
+      }
       createCallArgs.push(data);
       return data;
     });
+    mock.method(callService, 'getCallBySid', async (callSid) => ({
+      callSid,
+      agentId: '507f1f77bcf86cd799439011',
+      status: 'incoming',
+      direction: 'outbound',
+    }));
     mock.method(callService, 'markCompleted', async (callSid) => ({
       callSid,
       status: 'completed',
@@ -103,11 +116,14 @@ describe('outbound call API and TwiML', () => {
       systemInstruction: 'You are a test agent.',
       agent: { _id: '507f1f77bcf86cd799439011', name: 'Test Agent' },
     }));
+    mock.method(liveCallSession, 'primeOutboundLive', async () => null);
+    mock.method(liveCallSession, 'beginFirstResponseTimeline', () => {});
+    mock.method(liveCallSession, 'stampFirstResponse', () => Date.now());
     mock.method(dashboardSocket, 'broadcast', (event) => {
       broadcastEvents.push(event);
     });
     mock.method(twilioVoiceService, 'createOutboundCall', async ({ to }) => ({
-      callSid: 'CAoutboundtest001',
+      callSid: 'CAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       status: 'queued',
       to,
       from: env.twilioPhoneNumber,
@@ -159,7 +175,7 @@ describe('outbound call API and TwiML', () => {
     });
 
     assert.equal(res.status, 201);
-    assert.equal(res.json.callSid, 'CAoutboundtest001');
+    assert.equal(res.json.callSid, 'CAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
     assert.equal(res.json.direction, 'outbound');
     assert.equal(res.json.to, '+919876543210');
     assert.equal(res.json.from, '+15551234567');
@@ -180,10 +196,10 @@ describe('outbound call API and TwiML', () => {
     const res = await request(
       server,
       'POST',
-      '/api/outbound-call/CAoutboundtest001/hangup'
+      '/api/outbound-call/CAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/hangup'
     );
     assert.equal(res.status, 200);
-    assert.equal(res.json.callSid, 'CAoutboundtest001');
+    assert.equal(res.json.callSid, 'CAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
     assert.equal(res.json.status, 'completed');
   });
 
@@ -201,7 +217,7 @@ describe('outbound call API and TwiML', () => {
     broadcastEvents.length = 0;
 
     const body = new URLSearchParams({
-      CallSid: 'CAoutboundanswered1',
+      CallSid: 'CAbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
       From: '+15551234567',
       To: '+919876543210',
       Direction: 'outbound-api',
@@ -222,19 +238,63 @@ describe('outbound call API and TwiML', () => {
     assert.match(res.text, /media-stream/);
     assert.doesNotMatch(res.text, /ConversationRelay/i);
 
+    // createCall runs in background after TwiML response
+    await new Promise((r) => setTimeout(r, 40));
     assert.equal(createCallArgs.length, 1);
     assert.equal(createCallArgs[0].direction, 'outbound');
-    assert.equal(createCallArgs[0].callSid, 'CAoutboundanswered1');
+    assert.equal(createCallArgs[0].callSid, 'CAbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
     assert.ok(
       broadcastEvents.some((e) => e.type === 'CALL_OUTBOUND_ANSWERED')
     );
+  });
+
+  it('POST /voice/outbound sends TwiML without awaiting createCall', async () => {
+    createCallArgs.length = 0;
+    let releaseCreate;
+    createCallHold = new Promise((resolve) => {
+      releaseCreate = resolve;
+    });
+
+    try {
+      const body = new URLSearchParams({
+        CallSid: 'CAcccccccccccccccccccccccccccccccc',
+        From: '+15551234567',
+        To: '+919876543210',
+        Direction: 'outbound-api',
+      }).toString();
+
+      const started = Date.now();
+      const res = await request(
+        server,
+        'POST',
+        '/voice/outbound',
+        body,
+        'application/x-www-form-urlencoded'
+      );
+      const elapsed = Date.now() - started;
+
+      assert.equal(res.status, 200);
+      assert.match(res.text, /<Stream /);
+      assert.equal(createCallArgs.length, 0);
+      assert.ok(
+        elapsed < 500,
+        `TwiML should not wait on createCall (elapsed=${elapsed}ms)`
+      );
+
+      releaseCreate();
+      await new Promise((r) => setTimeout(r, 40));
+      assert.equal(createCallArgs.length, 1);
+      assert.equal(createCallArgs[0].callSid, 'CAcccccccccccccccccccccccccccccccc');
+    } finally {
+      createCallHold = null;
+    }
   });
 
   it('POST /voice inbound still returns Connect Stream (unchanged path)', async () => {
     createCallArgs.length = 0;
 
     const body = new URLSearchParams({
-      CallSid: 'CAinboundintact001',
+      CallSid: 'CAdddddddddddddddddddddddddddddddd',
       From: '+15550009999',
       To: '+15551234567',
       Direction: 'inbound',

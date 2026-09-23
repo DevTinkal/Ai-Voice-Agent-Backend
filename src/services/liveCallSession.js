@@ -457,6 +457,13 @@ function createEmptySession(callSid, twilioWs, streamSid, from, to) {
     audioForwardSkipped: 0,
     /** Optional PCM batching toward Gemini (default 0 = immediate). */
     pcmBatch: createPcmBatchState(env.geminiPcmBatchMs),
+    /**
+     * Gemini PCM queued before Twilio Media Stream is attached (outbound prime).
+     * @type {Array<{ pcm: Buffer, generation: number }>}
+     */
+    pendingOutboundPcm: [],
+    /** In-flight outbound Gemini prime promise (answer → Media Stream overlap). */
+    primePromise: null,
     gateWarnLogged: false,
     audioGateLogAt: 0,
     audioGateLogMsg: '',
@@ -641,10 +648,28 @@ function playGeminiPcmOnce(session, pcmBuffer, generationAtEnqueue) {
   if (generationAtEnqueue !== session.playbackGeneration) {
     return;
   }
-  if (!session.streamSid || !session.twilioWs || session.twilioWs.readyState !== 1) {
+  if (session.waiting || session.waitPhase === 'WAITING') {
     return;
   }
-  if (session.waiting || session.waitPhase === 'WAITING') {
+
+  const twilioReady =
+    Boolean(session.streamSid) &&
+    Boolean(session.twilioWs) &&
+    session.twilioWs.readyState === 1;
+
+  // Outbound prime: Media Stream not attached yet — queue PCM for flush.
+  if (!twilioReady) {
+    if (!Array.isArray(session.pendingOutboundPcm)) {
+      session.pendingOutboundPcm = [];
+    }
+    session.pendingOutboundPcm.push({
+      pcm: Buffer.from(pcmBuffer),
+      generation: generationAtEnqueue,
+    });
+    if (!session.firstGeminiAudioAt) {
+      session.firstGeminiAudioAt = nowMs();
+      logFirstResponse(session, 'first_gemini_audio');
+    }
     return;
   }
 
@@ -1583,7 +1608,9 @@ async function openGeminiLiveForCall(session, reason) {
   const liveSession = await geminiLiveService.connectLiveSession({
     ...bindLiveSessionCallbacks(session, listenerEpoch),
     systemInstruction,
-    midCall: Boolean(session.greeted) || reason !== 'start',
+    midCall:
+      Boolean(session.greeted) ||
+      (reason !== 'start' && reason !== 'prime'),
     sessionResumptionHandle: session.resumptionHandle || null,
   });
   return { liveSession, listenerEpoch };
@@ -1669,6 +1696,188 @@ async function reconnectLiveSession(session, reason) {
 }
 
 /**
+ * Flush Gemini PCM buffered during outbound prime once Twilio Media Stream is up.
+ * @param {object} session
+ */
+function flushPendingOutboundPcm(session) {
+  if (!session || !Array.isArray(session.pendingOutboundPcm)) {
+    return;
+  }
+  const queued = session.pendingOutboundPcm;
+  session.pendingOutboundPcm = [];
+  if (!queued.length) {
+    return;
+  }
+  logger.info(
+    'LIVE',
+    `[GREETING_FLUSH] callSid=${session.callSid} chunks=${queued.length}`
+  );
+  for (const item of queued) {
+    if (!item || !item.pcm) {
+      continue;
+    }
+    // Use current playback generation if the buffered gen was bumped away.
+    const gen =
+      item.generation === session.playbackGeneration
+        ? item.generation
+        : session.playbackGeneration;
+    playGeminiPcmOnce(session, item.pcm, gen);
+  }
+}
+
+/**
+ * Load agent prompt onto session (fail closed).
+ * @param {object} session
+ * @param {string} [preferredAgentId]
+ */
+async function loadAgentOntoSession(session, preferredAgentId) {
+  if (session.agentPrompt) {
+    return;
+  }
+  const callSid = session.callSid;
+  const call = await callService.getCallBySid(callSid);
+  let resolved;
+  if (preferredAgentId || (call && call.agentId)) {
+    const id = preferredAgentId || call.agentId;
+    const agent = await agentService.getAgentById(id);
+    if (
+      !agent ||
+      agent.status !== 'active' ||
+      !agent.prompts ||
+      agent.prompts.length === 0
+    ) {
+      throw new Error('Call agent is missing, disabled, or has no prompts');
+    }
+    const systemInstruction = agentService.assertLivePromptSize(agent);
+    if (!systemInstruction) {
+      throw new Error('Call agent has no configured prompts');
+    }
+    resolved = {
+      agentId: agent._id,
+      agentName: agent.name,
+      systemInstruction,
+    };
+  } else {
+    resolved = await agentService.requireAgentForCall();
+    if (call && !call.agentId) {
+      call.agentId = resolved.agentId;
+      await call.save().catch(() => {});
+    }
+  }
+  session.agentId = resolved.agentId;
+  session.agentName = resolved.agentName;
+  session.agentPrompt = resolved.systemInstruction;
+  logger.info(
+    'LIVE',
+    `agent loaded callSid=${callSid} agent=${session.agentName} promptChars=${session.agentPrompt.length}`
+  );
+}
+
+/**
+ * Start Gemini + greeting as soon as outbound callee answers (before Media Stream).
+ * Overlaps greeting TTS with Twilio stream setup.
+ * @param {string} callSid
+ * @param {{ from?: string, to?: string, agentId?: * }} [opts]
+ */
+async function primeOutboundLive(callSid, opts = {}) {
+  if (!callSid) {
+    return null;
+  }
+
+  let session = sessions.get(callSid);
+  if (!session) {
+    session = createEmptySession(
+      callSid,
+      null,
+      null,
+      opts.from || null,
+      opts.to || null
+    );
+    sessions.set(callSid, session);
+  } else {
+    if (opts.from) session.from = opts.from;
+    if (opts.to) session.to = opts.to;
+  }
+
+  if (session.liveSession || session.greeted) {
+    return session;
+  }
+  if (session.primePromise) {
+    return session.primePromise;
+  }
+  if (session.connecting || session.reconnecting) {
+    return session;
+  }
+
+  session.connecting = true;
+  logFirstResponse(session, 'prime_started');
+
+  session.primePromise = (async () => {
+    try {
+      await loadAgentOntoSession(session, opts.agentId);
+      logFirstResponse(session, 'agent_loading_completed');
+
+      // DB status marks must not delay greeting.
+      callService.markAnswered(callSid, null).catch(() => {});
+      callService.markInProgress(callSid).catch(() => {});
+      dashboardSocket.broadcast({
+        type: 'CALL_CONNECTED',
+        data: {
+          callSid,
+          from: session.from,
+          to: session.to,
+          status: 'connected',
+          sessionId: null,
+        },
+      });
+
+      logFirstResponse(session, 'prime_gemini_connect_started');
+      const { liveSession, listenerEpoch } = await openGeminiLiveForCall(
+        session,
+        'prime'
+      );
+
+      if (session.ending || !sessions.has(callSid)) {
+        closeLiveSessionQuietly(liveSession);
+        return session;
+      }
+      if (session.liveSession) {
+        closeLiveSessionQuietly(liveSession);
+        return session;
+      }
+
+      session.liveSession = liveSession;
+      session.reconnectAttempts = 0;
+      logFirstResponse(session, 'prime_gemini_connected');
+
+      if (!session.greeted) {
+        session.greeted = true;
+        geminiLiveService.requestGreeting(
+          liveSession,
+          buildGreetingInstruction()
+        );
+        logFirstResponse(session, 'prime_greeting_requested');
+        logger.info(
+          'LIVE',
+          `greeting primed once callSid=${callSid} epoch=${listenerEpoch}`
+        );
+      }
+      return session;
+    } catch (error) {
+      logger.error(
+        'LIVE',
+        `primeOutboundLive failed callSid=${callSid}: ${error.message}`
+      );
+      throw error;
+    } finally {
+      session.connecting = false;
+    }
+  })();
+
+  return session.primePromise;
+}
+
+/**
  * Create / attach exactly one Live call session when Twilio Media Stream starts.
  */
 async function startLiveCall({
@@ -1713,16 +1922,44 @@ async function startLiveCall({
 
   logFirstResponse(session, 'startLiveCall_started');
 
+  // Wait for in-flight outbound prime (Gemini + greeting already starting).
+  if (session.primePromise) {
+    try {
+      await session.primePromise;
+    } catch {
+      // Fall through to normal connect path.
+    }
+    session.primePromise = null;
+  }
+
+  // Primed path: attach Twilio WS and flush buffered greeting audio.
+  if (session.liveSession) {
+    session.twilioWs = twilioWs;
+    session.streamSid = streamSid || session.streamSid;
+    logFirstResponse(session, 'media_attached_to_prime');
+    flushPendingOutboundPcm(session);
+    callService.markAnswered(callSid, streamSid).catch(() => {});
+    callService.markInProgress(callSid).catch(() => {});
+    dashboardSocket.broadcast({
+      type: 'CALL_CONNECTED',
+      data: {
+        callSid,
+        from: session.from,
+        to: session.to,
+        status: 'connected',
+        sessionId: streamSid || null,
+      },
+    });
+    logger.info(
+      'LIVE',
+      `Live call attached to prime callSid=${callSid} streamSid=${streamSid}`
+    );
+    return session;
+  }
+
   // Idempotent: never attach two Gemini Live sessions to one call.
   if (session.connecting || session.reconnecting) {
     logger.warn('LIVE', `start ignored — already connecting callSid=${callSid}`);
-    return session;
-  }
-  if (session.liveSession) {
-    logger.warn(
-      'LIVE',
-      `start ignored — Live session already active callSid=${callSid} epoch=${session.liveSessionEpoch}`
-    );
     return session;
   }
 
@@ -1730,50 +1967,17 @@ async function startLiveCall({
   clearReconnectTimer(session);
 
   try {
-    // Fail closed: load singleton agent (or Call.agentId) before Gemini.
-    if (!session.agentPrompt) {
-      const call = await callService.getCallBySid(callSid);
-      let resolved;
-      if (call && call.agentId) {
-        const agent = await agentService.getAgentById(call.agentId);
-        if (
-          !agent ||
-          agent.status !== 'active' ||
-          !agent.prompts ||
-          agent.prompts.length === 0
-        ) {
-          throw new Error('Call agent is missing, disabled, or has no prompts');
-        }
-        const systemInstruction = agentService.assertLivePromptSize(agent);
-        if (!systemInstruction) {
-          throw new Error('Call agent has no configured prompts');
-        }
-        resolved = {
-          agentId: agent._id,
-          agentName: agent.name,
-          systemInstruction,
-        };
-      } else {
-        resolved = await agentService.requireAgentForCall();
-        if (call && !call.agentId) {
-          call.agentId = resolved.agentId;
-          await call.save().catch(() => {});
-        }
-      }
-      session.agentId = resolved.agentId;
-      session.agentName = resolved.agentName;
-      session.agentPrompt = resolved.systemInstruction;
-      logger.info(
-        'LIVE',
-        `agent loaded callSid=${callSid} agent=${session.agentName} promptChars=${session.agentPrompt.length}`
-      );
-    }
+    await loadAgentOntoSession(session);
     logFirstResponse(session, 'agent_loading_completed');
 
-    await callService.markAnswered(callSid, streamSid);
-    logFirstResponse(session, 'markAnswered_completed');
-    await callService.markInProgress(callSid);
-    logFirstResponse(session, 'markInProgress_completed');
+    // Do not block Gemini connect/greeting on Mongo marks.
+    const marksPromise = Promise.all([
+      callService.markAnswered(callSid, streamSid),
+      callService.markInProgress(callSid),
+    ]).then(() => {
+      logFirstResponse(session, 'markAnswered_completed');
+      logFirstResponse(session, 'markInProgress_completed');
+    });
 
     dashboardSocket.broadcast({
       type: 'CALL_CONNECTED',
@@ -1796,12 +2000,14 @@ async function startLiveCall({
     // Race: call may have ended while connecting.
     if (session.ending || !sessions.has(callSid)) {
       closeLiveSessionQuietly(liveSession);
+      await marksPromise.catch(() => {});
       return session;
     }
 
     if (session.liveSession) {
       // Should not happen given guards; close the extra socket.
       closeLiveSessionQuietly(liveSession);
+      await marksPromise.catch(() => {});
       return session;
     }
 
@@ -1818,10 +2024,13 @@ async function startLiveCall({
       logger.info('LIVE', `greeting requested once callSid=${callSid}`);
     }
 
+    flushPendingOutboundPcm(session);
+
     logger.info(
       'LIVE',
       `Live call ready callSid=${callSid} streamSid=${streamSid} epoch=${listenerEpoch}`
     );
+    await marksPromise.catch(() => {});
     return session;
   } finally {
     session.connecting = false;
@@ -2115,6 +2324,7 @@ module.exports = {
   getSession,
   getSessionByWs,
   startLiveCall,
+  primeOutboundLive,
   forwardTwilioMedia,
   endLiveCall,
   clearTwilioPlayback,
