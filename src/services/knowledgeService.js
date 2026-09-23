@@ -21,6 +21,54 @@ const INDEX_TIMEOUT_MS = 12 * 60 * 1000;
 /** Only one index rebuild at a time — overlapping Saves/restarts must not double-embed. */
 let indexInFlight = null;
 
+/**
+ * Live indexing progress for dashboard (in-memory; cleared when idle).
+ * @type {{
+ *   active: boolean,
+ *   phase: string,
+ *   completed: number,
+ *   total: number,
+ *   percent: number,
+ * } | null}
+ */
+let indexProgress = null;
+
+function setIndexProgress(partial) {
+  if (!partial) {
+    indexProgress = null;
+    return;
+  }
+  const completed = Math.max(0, Number(partial.completed) || 0);
+  const total = Math.max(0, Number(partial.total) || 0);
+  let percent = Number(partial.percent);
+  if (!Number.isFinite(percent)) {
+    if (total > 0) {
+      // Embeddings map to 10–95%; leave headroom for chunk/save phases.
+      percent = 10 + Math.round((completed / total) * 85);
+    } else {
+      percent = 5;
+    }
+  }
+  percent = Math.max(0, Math.min(99, Math.round(percent)));
+  indexProgress = {
+    active: true,
+    phase: String(partial.phase || 'indexing'),
+    completed,
+    total,
+    percent,
+  };
+}
+
+function clearIndexProgress() {
+  indexProgress = null;
+}
+
+function getIndexProgress() {
+  return indexProgress
+    ? { ...indexProgress }
+    : { active: false, phase: 'idle', completed: 0, total: 0, percent: 0 };
+}
+
 class KnowledgeError extends Error {
   constructor(message, status = 400, code = 'KNOWLEDGE_ERROR') {
     super(message);
@@ -239,6 +287,7 @@ async function indexDocumentOnce(documentId) {
   doc.status = 'indexing';
   doc.error = null;
   await doc.save();
+  setIndexProgress({ phase: 'chunking', completed: 0, total: 0, percent: 5 });
 
   try {
     const runIndex = async () => {
@@ -252,13 +301,28 @@ async function indexDocumentOnce(documentId) {
         `KNOWLEDGE_INDEX_CHUNKS document=${doc._id} chunks=${texts.length} chars=${String(doc.rawText || '').length}`
       );
 
+      setIndexProgress({
+        phase: 'embedding',
+        completed: 0,
+        total: texts.length,
+        percent: 10,
+      });
+
       // Drop previous chunks for this document first so old prompt text cannot
       // be retrieved while (or if) the new embedding run fails.
       await KnowledgeChunk.deleteMany({ documentId: doc._id });
       // Ensure RAM cannot serve stale vectors during rebuild.
       knowledgeMemoryIndex.invalidate();
 
-      const embeddings = await embeddingService.generateEmbeddings(texts);
+      const embeddings = await embeddingService.generateEmbeddings(texts, {
+        onProgress: ({ completed, total }) => {
+          setIndexProgress({
+            phase: 'embedding',
+            completed,
+            total,
+          });
+        },
+      });
       if (embeddings.length !== texts.length) {
         throw new Error('Embedding count mismatch');
       }
@@ -267,6 +331,13 @@ async function indexDocumentOnce(documentId) {
           throw new Error(`Empty embedding at chunk ${i}`);
         }
       }
+
+      setIndexProgress({
+        phase: 'saving',
+        completed: texts.length,
+        total: texts.length,
+        percent: 96,
+      });
 
       const modelName = embeddingService.getEmbeddingModel();
       const newRows = texts.map((text, index) => ({
@@ -299,6 +370,12 @@ async function indexDocumentOnce(documentId) {
         );
       }
 
+      setIndexProgress({
+        phase: 'ready',
+        completed: texts.length,
+        total: texts.length,
+        percent: 100,
+      });
       return doc;
     };
 
@@ -325,8 +402,14 @@ async function indexDocumentOnce(documentId) {
     doc.error = safe;
     await doc.save().catch(() => {});
     knowledgeMemoryIndex.invalidate();
+    clearIndexProgress();
     logger.error('KNOWLEDGE', `KNOWLEDGE_INDEX_FAILED document=${doc._id}: ${safe}`);
     throw error;
+  } finally {
+    if (doc.status === 'ready') {
+      // Keep 100% briefly visible via getStatus until next idle poll clears.
+      setTimeout(() => clearIndexProgress(), 2000);
+    }
   }
 }
 
@@ -549,6 +632,7 @@ async function getStatus() {
       filePath: null,
       error: 'Database not connected',
       embeddingModel: null,
+      progress: getIndexProgress(),
     };
   }
 
@@ -578,6 +662,7 @@ async function getStatus() {
     filePath: null,
     error: (doc && doc.error) || null,
     embeddingModel: (doc && doc.embeddingModel) || null,
+    progress: getIndexProgress(),
   };
 }
 
@@ -677,5 +762,6 @@ module.exports = {
   listDocuments,
   getDocument,
   getStatus,
+  getIndexProgress,
   searchKnowledge,
 };

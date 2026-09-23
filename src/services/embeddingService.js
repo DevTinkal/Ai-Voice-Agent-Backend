@@ -114,7 +114,11 @@ async function generateEmbedding(text) {
 /**
  * Embed many texts with batched requests + bounded concurrency.
  * @param {string[]} texts
- * @param {{ concurrency?: number, batchSize?: number }} [options]
+ * @param {{
+ *   concurrency?: number,
+ *   batchSize?: number,
+ *   onProgress?: (info: { completed: number, total: number }) => void,
+ * }} [options]
  * @returns {Promise<number[][]>}
  */
 async function generateEmbeddings(texts, options = {}) {
@@ -131,6 +135,8 @@ async function generateEmbeddings(texts, options = {}) {
     1,
     Math.min(Number(options.batchSize) || DEFAULT_BATCH_SIZE, 32)
   );
+  const onProgress =
+    typeof options.onProgress === 'function' ? options.onProgress : null;
 
   /** @type {{ start: number, items: string[] }[]} */
   const batches = [];
@@ -145,6 +151,10 @@ async function generateEmbeddings(texts, options = {}) {
   let nextBatch = 0;
   let completed = 0;
   const startedAt = Date.now();
+
+  if (onProgress) {
+    onProgress({ completed: 0, total: list.length });
+  }
 
   logger.info(
     'KNOWLEDGE',
@@ -178,6 +188,9 @@ async function generateEmbeddings(texts, options = {}) {
         results[batch.start + j] = vectors[j];
       }
       completed += batch.items.length;
+      if (onProgress) {
+        onProgress({ completed, total: list.length });
+      }
       if (
         completed === list.length ||
         completed % Math.max(batchSize * 2, 50) < batch.items.length
