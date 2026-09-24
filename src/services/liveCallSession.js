@@ -17,6 +17,7 @@ const {
   isIncompleteWaitPrefix,
   normalize: normalizeWaitText,
 } = require('../utils/waitIntent');
+const { evaluateWaitHoldAck } = require('../utils/waitAckSafety');
 const {
   mulaw8kToPcm16k,
   pcm24kToMulaw8k,
@@ -441,6 +442,14 @@ function createEmptySession(callSid, twilioWs, streamSid, from, to) {
     waitEnteredAt: null,
     waitPhrase: null,
     waitStreamEndSent: false,
+    /** First WAIT enter only: allow one short hold-ack evaluation (0|1). */
+    waitAckBudget: 0,
+    /** Buffered Gemini PCM while evaluating one-shot WAIT ack. */
+    waitAckPcmChunks: null,
+    waitAckPcmBytes: 0,
+    waitAckTranscript: '',
+    /** Bypass WAIT drop inside playGeminiPcmOnce while flushing an accepted ack. */
+    playingWaitAck: false,
     forwardAudio: true,
     inputTranscriptBuffer: '',
     outputTranscriptBuffer: '',
@@ -645,6 +654,89 @@ function handleGeminiInterrupted(session) {
   }
 }
 
+/** Max buffered PCM for one WAIT hold-ack (~2s @ 24kHz PCM16 mono). */
+const WAIT_ACK_MAX_PCM_BYTES = 24000 * 2 * 2;
+
+function resetWaitAckBuffers(session) {
+  if (!session) return;
+  session.waitAckPcmChunks = [];
+  session.waitAckPcmBytes = 0;
+  session.waitAckTranscript = '';
+  session.playingWaitAck = false;
+}
+
+function discardWaitAckBuffers(session, reason) {
+  if (!session) return;
+  const had =
+    (session.waitAckPcmBytes || 0) > 0 ||
+    Boolean(String(session.waitAckTranscript || '').trim());
+  resetWaitAckBuffers(session);
+  if (had) {
+    logWaitTrace(session, {
+      stage: 'WAIT_ACK',
+      text: '',
+      action: 'DISCARD',
+      reason: reason || 'discard',
+    });
+  }
+}
+
+/**
+ * Finalize buffered WAIT ack: play only if text is a short hold acknowledgement.
+ * Always consumes budget so WAIT never becomes a general pass-through.
+ */
+function finalizeWaitAck(session) {
+  if (!session || !(session.waitAckBudget > 0)) {
+    return;
+  }
+  const text = String(session.waitAckTranscript || '').replace(/\s+/g, ' ').trim();
+  const verdict = evaluateWaitHoldAck(text);
+  const chunks = Array.isArray(session.waitAckPcmChunks)
+    ? session.waitAckPcmChunks.slice()
+    : [];
+  const gen = session.playbackGeneration;
+
+  session.waitAckBudget = 0;
+  resetWaitAckBuffers(session);
+
+  if (!verdict.ok || !chunks.length) {
+    logWaitTrace(session, {
+      stage: 'WAIT_ACK',
+      text,
+      action: 'REJECT',
+      reason: !chunks.length ? 'no_audio' : verdict.reason,
+    });
+    logger.info(
+      'LIVE',
+      `[WAIT_ACK] callSid=${session.callSid || '?'} result=reject reason=${
+        !chunks.length ? 'no_audio' : verdict.reason
+      } text="${text.slice(0, 80).replace(/"/g, "'")}"`
+    );
+    return;
+  }
+
+  session.playingWaitAck = true;
+  try {
+    for (const pcm of chunks) {
+      module.exports.playGeminiPcmOnce(session, pcm, gen);
+    }
+  } finally {
+    session.playingWaitAck = false;
+  }
+  logWaitTrace(session, {
+    stage: 'WAIT_ACK',
+    text,
+    action: 'ACCEPT',
+    reason: verdict.reason,
+  });
+  logger.info(
+    'LIVE',
+    `[WAIT_ACK] callSid=${session.callSid || '?'} result=accept text="${text
+      .slice(0, 80)
+      .replace(/"/g, "'")}"`
+  );
+}
+
 /**
  * Convert one Gemini PCM chunk once and send each Twilio frame exactly once.
  */
@@ -658,7 +750,29 @@ function playGeminiPcmOnce(session, pcmBuffer, generationAtEnqueue) {
   if (generationAtEnqueue !== session.playbackGeneration) {
     return;
   }
-  if (session.waiting || session.waitPhase === 'WAITING') {
+
+  const waitingNow = session.waiting || session.waitPhase === 'WAITING';
+  if (waitingNow && !session.playingWaitAck) {
+    if (session.waitAckBudget > 0) {
+      if (!Array.isArray(session.waitAckPcmChunks)) {
+        session.waitAckPcmChunks = [];
+      }
+      const nextBytes = (session.waitAckPcmBytes || 0) + pcmBuffer.length;
+      if (nextBytes > WAIT_ACK_MAX_PCM_BYTES) {
+        session.waitAckBudget = 0;
+        discardWaitAckBuffers(session, 'pcm_oversize');
+        logWaitTrace(session, {
+          stage: 'WAIT_ACK',
+          text: '',
+          action: 'REJECT',
+          reason: 'pcm_oversize',
+        });
+        return;
+      }
+      session.waitAckPcmChunks.push(Buffer.from(pcmBuffer));
+      session.waitAckPcmBytes = nextBytes;
+      return;
+    }
     return;
   }
 
@@ -836,6 +950,23 @@ async function handleLiveToolCalls(session, functionCalls) {
     // File-sourced knowledge bootstrap removed — Agent.prompt is indexed on Save.
   // Never re-index during a live call — searchKnowledge reads ready chunks only.
   if (name === 'searchKnowledge') {
+      // WAIT hold: never search — one-shot ack must not become a knowledge answer.
+      if (isSessionWaiting(session)) {
+        logger.info(
+          'LIVE',
+          `[LIVE_TOOL] name=searchKnowledge callSid=${session.callSid} blocked=waiting`
+        );
+        responses.push({
+          id,
+          name: 'searchKnowledge',
+          response: {
+            found: false,
+            snippets: [],
+            message: 'Caller is on hold — do not answer yet.',
+          },
+        });
+        continue;
+      }
       const query =
         (call.args && (call.args.query || call.args.q)) || '';
       const q = String(query).replace(/\s+/g, ' ').trim();
@@ -972,6 +1103,10 @@ function handleLiveMessage(session, message, listenerEpoch) {
       text: session.inputTranscriptBuffer || '',
       action: isSessionWaiting(session) ? 'KEEP_WAITING_AFTER_INTERRUPT' : 'BARGE_IN_ONLY',
     });
+    if (isSessionWaiting(session) && session.waitAckBudget > 0) {
+      session.waitAckBudget = 0;
+      discardWaitAckBuffers(session, 'interrupted');
+    }
     handleGeminiInterrupted(session);
     // Do not play any audio that arrived on the same interrupted message.
     // Still allow flush of a completed WAIT utterance below if appropriate.
@@ -1050,9 +1185,17 @@ function handleLiveMessage(session, message, listenerEpoch) {
   }
 
   // --- AI transcript ---
-  // While WAIT is active, do not stream/finalize AI text (keeps UI on Waiting).
+  // While WAIT is active: buffer at most one short hold-ack; never stream a full answer.
   if (isSessionWaiting(session)) {
-    if (parsed.outputTranscription || (parsed.audioBuffers && parsed.audioBuffers.length)) {
+    if (session.waitAckBudget > 0) {
+      if (parsed.outputTranscription) {
+        session.waitAckTranscript =
+          (session.waitAckTranscript || '') + parsed.outputTranscription;
+      }
+      if (parsed.turnComplete || parsed.outputFinished) {
+        finalizeWaitAck(session);
+      }
+    } else if (parsed.outputTranscription || (parsed.audioBuffers && parsed.audioBuffers.length)) {
       logWaitTrace(session, {
         stage: 'SUPPRESS_AI',
         text: '',
@@ -1276,6 +1419,8 @@ function enterWaitHold(session, text, action = 'enter') {
   if (!waitingBefore) {
     session.waitEnteredAt = nowMs();
     session.waitStreamEndSent = false;
+    session.waitAckBudget = 1;
+    resetWaitAckBuffers(session);
   }
   // Drop any in-flight AI text so it cannot clear the Waiting UI later.
   session.outputTranscriptBuffer = '';
@@ -1391,6 +1536,8 @@ function clearWaitState(session) {
   session.waitEnteredAt = null;
   session.waitPhrase = null;
   session.waitStreamEndSent = false;
+  session.waitAckBudget = 0;
+  resetWaitAckBuffers(session);
 }
 
 async function onCallerUtterance(session, text) {
@@ -2528,6 +2675,8 @@ module.exports = {
   logAudioBatchHealth,
   ensurePcmBatch,
   isSessionWaiting,
+  finalizeWaitAck,
+  WAIT_ACK_MAX_PCM_BYTES,
   LIVE_RECONNECT_MAX_ATTEMPTS,
   LATENCY_LOG_PATH,
   beginFirstResponseTimeline,

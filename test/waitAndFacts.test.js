@@ -73,6 +73,94 @@ describe('waitIntent', () => {
   });
 });
 
+describe('waitAckSafety — short hold ack only', () => {
+  const {
+    evaluateWaitHoldAck,
+    isShortHoldAckText,
+  } = require('../src/utils/waitAckSafety');
+
+  it('accepts short conversational hold acknowledgements', () => {
+    for (const p of [
+      'Yeah, no rush.',
+      'Sure, take your time.',
+      'Of course.',
+      "Yeah, I'm here.",
+      'Oh, yeah, no rush.',
+    ]) {
+      const v = evaluateWaitHoldAck(p);
+      assert.equal(v.ok, true, `expected accept for: ${p} (${v.reason})`);
+      assert.equal(isShortHoldAckText(p), true);
+    }
+  });
+
+  it('rejects answer / RAG / follow-up leaks', () => {
+    const leaks = [
+      'Sure, no rush. The CEO is Morgan.',
+      'Yeah, take your time. So, regarding the pricing...',
+      'Of course. What kind of application are you building?',
+      'Sure, let me explain the requirements.',
+      'Yeah, no rush. The franchise investment starts at ten thousand.',
+    ];
+    for (const p of leaks) {
+      const v = evaluateWaitHoldAck(p);
+      assert.equal(v.ok, false, `expected reject for: ${p}`);
+    }
+  });
+
+  it('rejects empty, questions, and overlong text', () => {
+    assert.equal(evaluateWaitHoldAck('').ok, false);
+    assert.equal(evaluateWaitHoldAck('Ready when you are?').ok, false);
+    assert.equal(
+      evaluateWaitHoldAck(
+        'Yeah sure take your time I will just keep talking with many extra words here forever now'
+      ).ok,
+      false
+    );
+  });
+});
+
+describe('waitAckBudget finalize — not a general pass-through', () => {
+  it('plays short ack PCM once then consumes budget; rejects leak text', () => {
+    const live = require('../src/services/liveCallSession');
+    const played = [];
+    const session = {
+      callSid: 'CA_WAIT_ACK',
+      waiting: true,
+      waitPhase: 'WAITING',
+      waitAckBudget: 1,
+      waitAckPcmChunks: [Buffer.alloc(320, 1)],
+      waitAckPcmBytes: 320,
+      waitAckTranscript: 'Yeah, no rush.',
+      playbackGeneration: 1,
+      playingWaitAck: false,
+      streamSid: null,
+      twilioWs: null,
+    };
+    const orig = live.playGeminiPcmOnce;
+    live.playGeminiPcmOnce = (s, pcm) => {
+      played.push(pcm.length);
+    };
+    try {
+      live.finalizeWaitAck(session);
+      assert.equal(session.waitAckBudget, 0);
+      assert.equal(played.length, 1);
+      assert.equal(session.playingWaitAck, false);
+
+      session.waitAckBudget = 1;
+      session.waitAckPcmChunks = [Buffer.alloc(320, 2)];
+      session.waitAckPcmBytes = 320;
+      session.waitAckTranscript =
+        'Sure, no rush. The franchise investment starts at ten thousand.';
+      played.length = 0;
+      live.finalizeWaitAck(session);
+      assert.equal(session.waitAckBudget, 0);
+      assert.equal(played.length, 0);
+    } finally {
+      live.playGeminiPcmOnce = orig;
+    }
+  });
+});
+
 describe('no hardcoded company prompt modules', () => {
   it('agent.config and companyQuickFacts are removed', () => {
     assert.equal(

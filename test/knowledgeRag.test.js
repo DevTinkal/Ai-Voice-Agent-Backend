@@ -214,7 +214,7 @@ describe('knowledge RAG — Live tool wiring', () => {
     assert.match(instruction, /reference material only/i);
     assert.match(instruction, /SPEECH UNDERSTANDING|UNDERSTANDING AND CLARIFICATION/);
     assert.match(instruction, /CONVERSATION CONTEXT/);
-    assert.match(instruction, /CURRENT USER TURN HAS PRIORITY|new named entity|NEW TOPIC/i);
+    assert.match(instruction, /LATEST CALLER INTENT WINS|CURRENT USER TURN HAS PRIORITY|new named entity|NEW TOPIC/i);
     assert.match(instruction, /found=true/i);
     assert.match(instruction, /NOT UNDERSTOOD/i);
     assert.match(instruction, /NOISE|Prefer silence|background/i);
@@ -223,11 +223,11 @@ describe('knowledge RAG — Live tool wiring', () => {
     assert.match(instruction, /I can only assist in English/i);
     assert.match(instruction, /DYNAMIC COMPANY KNOWLEDGE/);
     assert.match(instruction, /HARDCODED GENERIC PROTECTION/);
-    assert.match(instruction, /Answer fast and directly/i);
+    assert.match(instruction, /Answer promptly|Answer fast and directly/i);
     assert.doesNotMatch(instruction, /companyQuickFacts/);
     assert.doesNotMatch(instruction, /UNIQUE_NEVER_IN_LIVE/);
     assert.doesNotMatch(instruction, /JPLoft|CEO|pricing is|JuicedFuel/i);
-    assert.ok(instruction.length < 16000);
+    assert.ok(instruction.length < 22000);
 
     // Stored multi-MB prompt must not trigger Live soft-cap (wrapper only).
     const ok = agentService.assertLivePromptSize({

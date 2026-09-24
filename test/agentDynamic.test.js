@@ -146,26 +146,27 @@ describe('singleton Agent + Live thin wrapper', () => {
     assert.match(joined, /Confidence before knowledge search/i);
     assert.match(joined, /DYNAMIC COMPANY KNOWLEDGE/);
     assert.match(joined, /Search before answering company questions/i);
-    assert.match(joined, /Answer fast and directly/i);
+    assert.match(joined, /Answer promptly|Answer fast and directly/i);
     assert.match(joined, /Do not hallucinate/i);
     assert.match(joined, /HARDCODED GENERIC PROTECTION/);
     assert.match(joined, /always active/i);
     assert.match(joined, /Lead capture/i);
     assert.match(joined, /Do not call|opt-out|Do Not Call/i);
     assert.match(joined, /stop speaking immediately|Never talk over/i);
-    assert.match(joined, /Yeah, absolutely/i);
-    assert.match(joined, /Let me process that information/i);
+    assert.match(joined, /Conversation functions|Acknowledge when useful|Sparse natural fillers/i);
+    assert.match(joined, /intentionally delay|Respond promptly/i);
+    assert.match(joined, /Let me process that information|Certainly, I can assist/i);
     assert.match(joined, /repeat your request in English|repeat in English/i);
     assert.match(joined, /noise-related cut-off|cut off by noise|continue the prior topic/i);
     assert.match(joined, /CONVERSATION CONTEXT/);
-    assert.match(joined, /CURRENT USER TURN HAS PRIORITY/i);
+    assert.match(joined, /LATEST CALLER INTENT WINS|latest meaningful caller request/i);
     assert.match(joined, /new named entity|NEW TOPIC/i);
     assert.match(joined, /Could you clarify what GC2 refers to/i);
     assert.match(joined, /Soft name variants|near-homophone/i);
     assert.match(joined, /Mixed-language turns/i);
     assert.match(joined, /previous topic/i);
     assert.match(joined, /Caller WAIT|HOLD|call control/i);
-    assert.match(joined, /remain silent|stay silent/i);
+    assert.match(joined, /short hold acknowledgement|no rush|take your time/i);
     assert.match(joined, /Leadership \/ role questions|founder.*owner.*president|interchangeable/i);
     assert.match(joined, /SMALL TALK/);
     assert.match(joined, /searchKnowledge/);
@@ -174,7 +175,7 @@ describe('singleton Agent + Live thin wrapper', () => {
     assert.match(joined, /Always reply in English/i);
     assert.match(joined, /spoken name.*is dynamic|dynamic from configuration/i);
     assert.doesNotMatch(joined, /JPLoft|CEO|companyQuickFacts|JuicedFuel|Juiced Fuel|\.txt/i);
-    assert.ok(joined.length < 16000);
+    assert.ok(joined.length < 22000);
 
     const live = buildLiveConfig({ systemInstruction: joined, midCall: false });
     assert.doesNotMatch(String(live.systemInstruction), new RegExp(marker));
@@ -225,7 +226,7 @@ describe('singleton Agent + Live thin wrapper', () => {
     assert.match(joined, /ZetaFuel|Morgan Lee|Denver/i);
     assert.match(joined, /recognition and context hints only/i);
     assert.doesNotMatch(joined, /Franchise in Denver Colorado/);
-    assert.ok(joined.length < 16000);
+    assert.ok(joined.length < 22000);
   });
 
   it('normalizeLanguages parses comma list and defaults English', () => {

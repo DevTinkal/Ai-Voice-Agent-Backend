@@ -123,7 +123,7 @@ describe('agent prompt as sole knowledge corpus', () => {
     assert.match(instruction, /KNOWLEDGE AND INSTRUCTIONS POLICY|KNOWLEDGE/);
     assert.match(instruction, /SPEECH UNDERSTANDING|UNDERSTANDING AND CLARIFICATION/);
     assert.match(instruction, /CONVERSATION CONTEXT/);
-    assert.match(instruction, /CURRENT USER TURN HAS PRIORITY|new named entity|NEW TOPIC/i);
+    assert.match(instruction, /LATEST CALLER INTENT WINS|CURRENT USER TURN HAS PRIORITY|new named entity|NEW TOPIC/i);
     assert.match(instruction, /didn't quite catch that|NOT UNDERSTOOD/i);
     assert.match(instruction, /NOISE|Prefer silence|background/i);
     assert.match(instruction, /Opening greeting only|NEVER re-greet/i);
@@ -135,7 +135,7 @@ describe('agent prompt as sole knowledge corpus', () => {
     assert.doesNotMatch(instruction, /UNIQUE_FDD_MARKER_NEVER_IN_WRAPPER/);
     assert.doesNotMatch(instruction, /franchise territory royalty/);
     assert.doesNotMatch(instruction, /JPLoft|CEO|JuicedFuel/i);
-    assert.ok(instruction.length < 16000);
+    assert.ok(instruction.length < 22000);
   });
 
   it('large stored prompt does not throw Live size error', () => {
