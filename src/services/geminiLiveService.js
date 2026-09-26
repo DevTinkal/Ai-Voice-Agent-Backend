@@ -205,12 +205,10 @@ async function connectLiveSession(handlers) {
     config.tools[0].functionDeclarations[0];
   logger.info(
     'LIVE',
-    `tool searchKnowledge behavior=${
-      (searchDecl && searchDecl.behavior) || 'unset'
-    } thinkingConfig=${
-      Object.prototype.hasOwnProperty.call(config, 'thinkingConfig')
-        ? 'present'
-        : 'absent'
+    `tool searchKnowledge behavior=${(searchDecl && searchDecl.behavior) || 'unset'
+    } thinkingConfig=${Object.prototype.hasOwnProperty.call(config, 'thinkingConfig')
+      ? 'present'
+      : 'absent'
     }`
   );
   logger.info(
@@ -219,8 +217,7 @@ async function connectLiveSession(handlers) {
   );
   logger.info(
     'LIVE',
-    `session mgmt compression=slidingWindow resumptionHandle=${
-      handlers.sessionResumptionHandle ? 'yes' : 'new'
+    `session mgmt compression=slidingWindow resumptionHandle=${handlers.sessionResumptionHandle ? 'yes' : 'new'
     }`
   );
   logger.info(
