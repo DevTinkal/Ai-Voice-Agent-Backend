@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "test": "node --test test/audioCodec.test.js test/waitAndFacts.test.js test/promptAndTwiml.test.js test/audioDedupe.test.js test/bargeInGate.test.js test/speechGate.test.js test/latencyBreakdown.test.js test/outboundCall.test.js test/outboundGreetingPrime.test.js test/callerTranscript.test.js test/sessionResume.test.js test/agentDynamic.test.js test/knowledgeRag.test.js test/singleSourceKnowledge.test.js test/knowledgeMemoryIndex.test.js test/pcmBatcher.test.js",
+    "test": "node --test test/audioCodec.test.js test/waitAndFacts.test.js test/promptAndTwiml.test.js test/audioDedupe.test.js test/bargeInGate.test.js test/speechGate.test.js test/latencyBreakdown.test.js test/outboundCall.test.js test/outboundGreetingPrime.test.js test/callerTranscript.test.js test/sessionResume.test.js test/agentDynamic.test.js test/knowledgeRag.test.js test/singleSourceKnowledge.test.js test/knowledgeMemoryIndex.test.js test/pcmBatcher.test.js test/classicPipeline.test.js",
     "check": "node --check src/server.js && node --check src/app.js && find src -name '*.js' -print0 | xargs -0 -n1 node --check"
   },
   "engines": {

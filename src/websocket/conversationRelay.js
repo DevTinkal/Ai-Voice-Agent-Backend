@@ -41,9 +41,9 @@ function validateConversationRelaySignature(request) {
     env.conversationRelayWsUrl ||
     (env.publicBaseUrl
       ? `${env.publicBaseUrl
-          .replace(/^http:/, 'ws:')
-          .replace(/^https:/, 'wss:')
-          .replace(/\/$/, '')}/conversation-relay`
+        .replace(/^http:/, 'ws:')
+        .replace(/^https:/, 'wss:')
+        .replace(/\/$/, '')}/conversation-relay`
       : '');
 
   if (!url) {

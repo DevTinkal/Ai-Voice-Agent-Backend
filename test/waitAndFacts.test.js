@@ -25,6 +25,10 @@ describe('waitIntent', () => {
       'let me think',
       'Wait.',
       'HOLD ON',
+      'Okay. Wait.',
+      'ok wait',
+      'yeah hold on',
+      'yes hang on',
     ];
     for (const p of phrases) {
       assert.equal(isWaitHold(p), true, `expected WAIT for: ${p}`);

@@ -1,6 +1,6 @@
 'use strict';
 
-const { describe, it } = require('node:test');
+const { describe, it, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('http');
 const liveCallSession = require('../src/services/liveCallSession');
@@ -12,6 +12,9 @@ const {
 } = require('../src/controllers/voiceController');
 const { createApp } = require('../src/app');
 const { env } = require('../src/config/env');
+
+// These cases exercise Gemini Live dial/answer priming — not classic STT/LLM/TTS.
+const priorVoicePipeline = env.voicePipeline;
 
 function mockAgentAndCall(callSid) {
   const originalConnect = geminiLiveService.connectLiveSession;
@@ -80,6 +83,13 @@ function fakeGreetingPcm() {
 }
 
 describe('outbound greeting prime', () => {
+  before(() => {
+    env.voicePipeline = 'live';
+  });
+  after(() => {
+    env.voicePipeline = priorVoicePipeline;
+  });
+
   it('buffers Gemini PCM until Twilio Media Stream attaches then flushes once', async () => {
     const callSid = 'CA_PRIME_GREET_1';
     const sentFrames = [];

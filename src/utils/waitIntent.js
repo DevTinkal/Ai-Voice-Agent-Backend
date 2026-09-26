@@ -136,6 +136,17 @@ function isWaitHold(text) {
     return true;
   }
 
+  // "Okay. Wait." / "ok hold on" — short ack then hold (Flux often glues these).
+  if (
+    words.length <= 5 &&
+    !NON_WAIT_CONTENT.test(lower) &&
+    /^(okay|ok|alright|all\s+right|yeah|yes)[,.]?\s+(wait|hold\s+on|hang\s+on)\b/i.test(
+      value
+    )
+  ) {
+    return true;
+  }
+
   // Repeated wait/hold/hang tokens only.
   if (
     /^(wait|hold|hang)([.\s!,]+(wait|hold|on|hang|please|a|second|sec|moment|minute|min))*$/i.test(

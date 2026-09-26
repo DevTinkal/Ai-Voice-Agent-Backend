@@ -341,6 +341,65 @@ Terms: ${terms.join(', ')}`;
 }
 
 /**
+ * Extract only explicitly labeled call context from Agent Prompt text.
+ * Does not scrape free-form brand names into the thin wrapper (facts stay in RAG).
+ * @param {string} promptText
+ * @returns {{ company: string | null, role: string | null, purpose: string | null }}
+ */
+function extractConfiguredCallContext(promptText) {
+  const text = String(promptText || '');
+  function labeled(keys) {
+    const re = new RegExp(
+      `(?:^|\\n)\\s*(?:${keys})\\s*[:=]\\s*([^\\n]{2,80})`,
+      'i'
+    );
+    const m = text.match(re);
+    if (!m) return null;
+    const value = String(m[1] || '')
+      .replace(/[.。]+$/, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return value || null;
+  }
+  return {
+    company: labeled(
+      'company(?:\\s+name)?|business(?:\\s+name)?|organization(?:\\s+name)?'
+    ),
+    role: labeled('role|agent\\s+role|your\\s+role'),
+    purpose: labeled('purpose|call\\s+purpose|reason\\s+for\\s+(?:the\\s+)?call'),
+  };
+}
+
+/**
+ * @param {string} agentName
+ * @param {string} promptText
+ */
+function buildConfiguredCallContextPolicy(agentName, promptText) {
+  const name = String(agentName || '').trim() || 'Assistant';
+  const ctx = extractConfiguredCallContext(promptText);
+  const companyLine = ctx.company
+    ? `- Company / business (from dashboard Agent Prompt label only): ${ctx.company}`
+    : '- Company / business: not inlined here — call searchKnowledge for company identity and facts from the dashboard Agent Prompt index';
+  const lines = [
+    'CONFIGURED CALL CONTEXT (dashboard only):',
+    `- Agent spoken name: ${name}`,
+    companyLine,
+  ];
+  if (ctx.role) {
+    lines.push(`- Role (labeled): ${ctx.role}`);
+  }
+  if (ctx.purpose) {
+    lines.push(`- Call purpose (labeled): ${ctx.purpose}`);
+  }
+  lines.push(
+    'Never invent company identity, products, prices, people, or policies.',
+    'Never answer company facts without searchKnowledge results from the dashboard Agent Prompt.',
+    'When the caller asks your name, use only the Agent spoken name above.'
+  );
+  return lines.join('\n');
+}
+
+/**
  * Stored Agent.prompt text (single string). Never sent in full to Gemini Live.
  */
 function combinePrompts(agent) {
@@ -374,9 +433,11 @@ When the caller asks your name, say you are ${name}.`;
   const dynamicKnowledge = buildDynamicCompanyKnowledgePolicy();
   const dashboardBehavior = buildDashboardBehaviorPolicy();
   const phone = buildPhoneStylePolicy(name);
+  const configured = buildConfiguredCallContextPolicy(name, stored);
   const domainHints = buildDomainSpeechHintsPolicy(stored);
   const parts = [
     identity,
+    configured,
     phone,
     dashboardBehavior,
     speech,
@@ -670,6 +731,7 @@ module.exports = {
   buildLanguagePolicy,
   buildKnowledgePolicy,
   extractDomainSpeechHints,
+  extractConfiguredCallContext,
   combinePrompts,
   buildAgentSystemInstruction,
   assertLivePromptSize,

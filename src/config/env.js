@@ -69,6 +69,27 @@ const env = {
     0,
     Math.floor(Number(process.env.GEMINI_PCM_BATCH_MS) || 0)
   ),
+  /**
+   * Phone audio brain: `live` = Gemini Live (rollback).
+   * `classic` = Deepgram Flux STT → Gemini text + RAG → ElevenLabs TTS.
+   * Unset stays `live` so existing calls keep working until keys are set.
+   */
+  voicePipeline:
+    String(process.env.VOICE_PIPELINE || 'live').toLowerCase() === 'classic'
+      ? 'classic'
+      : 'live',
+  deepgramApiKey: process.env.DEEPGRAM_API_KEY || '',
+  deepgramFluxModel: process.env.DEEPGRAM_FLUX_MODEL || 'flux-general-en',
+  elevenLabsApiKey: process.env.ELEVENLABS_API_KEY || '',
+  elevenLabsVoiceId: process.env.ELEVENLABS_VOICE_ID || '',
+  elevenLabsModel: process.env.ELEVENLABS_MODEL || 'eleven_flash_v2_5',
+  outboundAmbienceEnabled:
+    String(process.env.OUTBOUND_AMBIENCE_ENABLED || '').toLowerCase() ===
+    'true',
+  outboundAmbienceGain: Math.min(
+    1,
+    Math.max(0, Number(process.env.OUTBOUND_AMBIENCE_GAIN) || 0.08)
+  ),
 };
 
 function getVoiceWebhookUrl() {

@@ -37,6 +37,7 @@ const {
   summarizePcmBatch,
 } = require('../utils/pcmBatcher');
 const { buildGreetingInstruction } = require('../config/prompts');
+const classicPipeline = require('../pipeline/classicCallSession');
 const logger = require('../utils/logger');
 
 /** @type {Map<string, object>} */
@@ -1609,7 +1610,7 @@ async function onCallerUtterance(session, text) {
 }
 
 function closeLiveSessionQuietly(liveSession) {
-  if (!liveSession) {
+  if (!liveSession || typeof liveSession.close !== 'function') {
     return;
   }
   try {
@@ -2075,6 +2076,27 @@ async function primeOutboundLive(callSid, opts = {}) {
   }
 
   // Already primed (dial or answer) — no second Live connect / greeting.
+  if (classicPipeline.isClassicPipeline()) {
+    if (session.greetingClipReady || (session.pipeline === 'classic' && session.greeted)) {
+      return session;
+    }
+    if (session.classicPrimePromise) {
+      return session.classicPrimePromise;
+    }
+    session.primedAtDial = atDial;
+    session.classicPriming = true;
+    session.classicPrimePromise = (async () => {
+      try {
+        await loadAgentOntoSession(session, opts.agentId);
+        return classicPipeline.primeClassic(session, atDial);
+      } finally {
+        session.classicPriming = false;
+        session.classicPrimePromise = null;
+      }
+    })();
+    return session.classicPrimePromise;
+  }
+
   if (session.liveSession || session.greeted) {
     return session;
   }
@@ -2252,6 +2274,9 @@ async function startLiveCall({
 
   // Primed path: attach Twilio WS; flush only if greeting was not already Played.
   if (session.liveSession) {
+    if (session.pipeline === 'classic' && !session.flux) {
+      await classicPipeline.attachClassic(session);
+    }
     session.twilioWs = twilioWs;
     session.streamSid = streamSid || session.streamSid;
     logFirstResponse(session, 'media_attached_to_prime');
@@ -2287,6 +2312,29 @@ async function startLiveCall({
 
   session.connecting = true;
   clearReconnectTimer(session);
+
+  if (classicPipeline.isClassicPipeline()) {
+    try {
+      await loadAgentOntoSession(session);
+      session.pipeline = 'classic';
+      await classicPipeline.attachClassic(session);
+      callService.markAnswered(callSid, streamSid).catch(() => {});
+      callService.markInProgress(callSid).catch(() => {});
+      dashboardSocket.broadcast({
+        type: 'CALL_CONNECTED',
+        data: {
+          callSid,
+          from: session.from,
+          to: session.to,
+          status: 'connected',
+          sessionId: streamSid || null,
+        },
+      });
+      return session;
+    } finally {
+      session.connecting = false;
+    }
+  }
 
   try {
     await loadAgentOntoSession(session);
@@ -2491,6 +2539,12 @@ function sendCallerPcmToGemini(session, pcm16k) {
 }
 
 function forwardTwilioMedia(session, payloadBase64) {
+  if (session && session.pipeline === 'classic') {
+    if (!session.forwardAudio || !payloadBase64) return;
+    session.inboundMediaCount = (session.inboundMediaCount || 0) + 1;
+    classicPipeline.forwardClassicMedia(session, payloadBase64);
+    return;
+  }
   // waiting must NOT block PCM — only forwardAudio=false (call end) stops input.
   if (!session || !session.liveSession || !session.forwardAudio) {
     if (session) {
@@ -2595,6 +2649,7 @@ async function endLiveCall(callSid, reason = 'stop') {
   }
   session.ending = true;
   session.forwardAudio = false;
+  classicPipeline.closeClassic(session);
   clearReconnectTimer(session);
   bumpPlaybackGeneration(session);
 

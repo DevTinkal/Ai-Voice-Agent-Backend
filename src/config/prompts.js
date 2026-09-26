@@ -3,13 +3,13 @@
 const { getTimeOfDay, DEFAULT_TIMEZONE } = require('../utils/timeOfDay');
 
 /**
- * Purely technical voice-channel append for Gemini Live.
+ * Purely technical voice-channel append for phone (Live or classic).
  * No identity, company, sales, or hardcoded agent personality.
  *
- * @param {string} baseInstruction - Combined Agent.prompts (+ language policy) from MongoDB
+ * @param {string} baseInstruction - Thin Agent wrapper from MongoDB
  * @param {Date} [now]
  * @param {string} [timeZone]
- * @param {{ midCall?: boolean }} [options]
+ * @param {{ midCall?: boolean, channelLabel?: string }} [options]
  */
 function buildSystemInstruction(
   baseInstruction,
@@ -24,6 +24,9 @@ function buildSystemInstruction(
 
   const { greeting, period } = getTimeOfDay(now, timeZone);
   const midCall = Boolean(options.midCall);
+  const channelLabel =
+    String(options.channelLabel || '').trim() ||
+    'Twilio phone call via Gemini Live bidirectional audio';
 
   const phaseBlock = midCall
     ? `Call phase: MID-CALL. Do not greet again. Do not re-introduce your name. Do not say "${greeting}". Do not produce a fresh "how can I help you today" opening. Continue only when there is a meaningful caller request.`
@@ -32,9 +35,9 @@ function buildSystemInstruction(
   return `${base}
 
 ==================================================
-PHONE VOICE CHANNEL & RUNTIME CONTEXT (GEMINI LIVE)
+PHONE VOICE CHANNEL & RUNTIME CONTEXT
 ==================================================
-Channel: Twilio phone call via Gemini Live bidirectional audio.
+Channel: ${channelLabel}.
 Period: ${period}.
 Follow the LANGUAGE POLICY in the configured system instructions above for spoken replies.
 
@@ -51,7 +54,7 @@ CRITICAL VOICE OUTPUT RULES:
 8. Imperfect but meaningful English: infer intent and answer normally — optionally confirm with "Oh, okay, so you mean…?" — do not clarify only for bad grammar. Never expose chain-of-thought.
 9. Unclear but likely caller speech: prefer a natural clarification; at most one short repeat-ask; avoid clarification loops on successive noise.
 10. Company facts and Agent Prompt content come only from searchKnowledge — never invent company details.
-11. Genuine caller barge-in: stop and answer the latest meaningful request. Brief alone acknowledgments ("yeah", "okay") while you speak are backchannel — do not treat as a new question; "yeah, but…" with a new ask is a new request. Do not treat noise as barge-in that needs a spoken reply.
+11. Genuine caller barge-in: stop and answer the latest meaningful request. Brief alone acknowledgments ("yeah", "okay") while you speak are backchannel — do not treat as a new question; "yeah, but…" with a new ask is a new request. Do not treat noise as barge-in that needs a spoken reply. Backend turn control is authoritative for WAIT / barge-in audio / backchannel vs new-request; keep acknowledge → interpret → answer → one follow-up in speech.
 12. After a noise cut-off with no clear new request: do not restart with a greeting; wait or continue the prior topic briefly.
 13. Latest meaningful caller request wins. New named entity or clear topic switch: search/answer for THAT topic immediately. If unmatched, clarify or say unavailable — never answer with the previous topic's facts. Do not repeat a prior answer unless the caller asks.
 14. Do-not-call / remove-me requests: confirm politely, stop sales/lead capture, end the call politely.

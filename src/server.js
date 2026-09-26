@@ -12,6 +12,7 @@ const mediaStream = require('./websocket/mediaStream');
 const conversationRelay = require('./websocket/conversationRelay');
 const dashboardSocket = require('./websocket/dashboardSocket');
 const liveCallSession = require('./services/liveCallSession');
+const { clearTurnCtrlLogOnStartup } = require('./pipeline/conversationOrchestrator');
 const knowledgeMemoryIndex = require('./services/knowledgeMemoryIndex');
 const knowledgeService = require('./services/knowledgeService');
 const { migrateOnceIfEmpty } = require('./services/agentBootstrap');
@@ -20,6 +21,7 @@ const logger = require('./utils/logger');
 async function start() {
   // Fresh latency log per server run (tests write here too; startup clears them).
   liveCallSession.clearLatencyLogOnStartup();
+  clearTurnCtrlLogOnStartup();
 
   const app = createApp();
   const server = http.createServer(app);
